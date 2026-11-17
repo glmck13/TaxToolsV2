@@ -1925,7 +1925,7 @@ def handle_email_welcome_letter_only(form):
 
     # 7. Configure and Dispatch via Resend API
     email_from = get_form_val(form, "email_from", OWNER_EMAIL).strip()
-    email_subject = get_form_val(form, "email_subject") or f"Welcome to the {TAX_YEAR} Tax Season!"
+    email_subject = get_form_val(form, "email_subject") or f"Your {TAX_YEAR} Tax Documents"
 
     resend.api_key = os.environ.get("RESEND_API_KEY")
 
@@ -2393,7 +2393,7 @@ def build_engagement_story(form, include_esign_tags=False, include_cover_letter=
         if not in_agreement_section and not welcome_ack_injected and re.match(r'^\d+\.\s+', line_str):
             story.extend(build_acknowledgment_flowables(
                 field_prefix="welcome",
-                client_label="I have reviewed the welcome instructions and portal links below.",
+                client_label="After signing, you will receive a fully executed copy. Please save this copy for your records, as it will also contain links to your Questionnaire, SharePoint folders, and Checklist.  Your links are included below for easy reference.",
                 firm_label=None
             ))
             welcome_ack_injected = True
@@ -2402,13 +2402,13 @@ def build_engagement_story(form, include_esign_tags=False, include_cover_letter=
             story.append(Paragraph(xml_safe_escape(line_str[2:]), h1_style))
         elif line_str.startswith("## ") or line_str.startswith("### "):
             # 2. Engagement Agreement: Inject right before the first ### subheading
-            if in_agreement_section and not agreement_ack_injected and line_str.startswith("### "):
-                story.extend(build_acknowledgment_flowables(
-                    field_prefix="agree",
-                    client_label="I have read and agree to the Tax Services Engagement Agreement terms below.",
-                    firm_label="Scope and fees reviewed prior to counter-signing."
-                ))
-                agreement_ack_injected = True
+            # if in_agreement_section and not agreement_ack_injected and line_str.startswith("### "):
+            #     story.extend(build_acknowledgment_flowables(
+            #         field_prefix="agree",
+            #         client_label="I have read and agree to the Tax Services Engagement Agreement terms below.",
+            #         firm_label="Scope and fees reviewed prior to counter-signing."
+            #     ))
+            #     agreement_ack_injected = True
             story.append(Paragraph(xml_safe_escape(re.sub(r'^#+\s*', '', line_str)), h2_style))
         elif re.match(r'^\d+\.\s+', line_str):
             num_match = re.match(r'^(\d+\.)\s+(.*)', line_str)
@@ -3079,7 +3079,7 @@ def execute_transactional_pipeline(form):
 
     include_welcome_letter = get_form_val(form, "include_cover_letter", "false").lower() in ["true", "1", "yes"]
     if is_ajax_request(form) or include_welcome_letter:
-        adobe_email_subject = f"Welcome to the {TAX_YEAR} Tax Season!"
+        adobe_email_subject = f"Your {TAX_YEAR} Tax Documents"
         adobe_email_message = (
             f"Dear {friendly_name},\n\n"
             f"Welcome to the {TAX_YEAR} tax preparation season! We have prepared a welcome package "
