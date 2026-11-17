@@ -1,0 +1,3323 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import html
+import re
+import io
+import urllib.parse
+import urllib.request
+import datetime
+import time
+import unicodedata
+import stat
+import base64
+import resend
+import markdown
+
+
+from jinja2 import Template
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether, Image, PageBreak, Flowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+# ==========================================
+# CONFIGURATION & GLOBAL STATE
+# ==========================================
+
+# Weighted Sum Modulo & Security Constants
+SECRET_MASK = 42719
+WEIGHTED_MULTIPLIER = 7
+WEIGHTED_OFFSET = 3
+WEIGHTED_MODULO = 99
+
+PIPELINE_SANDBOX = os.environ.get("PIPELINE_SANDBOX")
+if PIPELINE_SANDBOX:
+    ENABLE_BATCH_MODE = True
+    JS_FILE = "engagement_sandbox.js"
+    CSS_FILE = "engagement_sandbox.css"
+    ENGAGEMENT_TEMPLATE = "engagement_sandbox.md"
+    SERVICES_TEMPLATE = "services_sandbox.md"
+    CONSENT_SCRIPT = "consent_sandbox.cgi"
+    OWNER_EMAIL = "dianna@tarrantadvisors.com"
+    OWNER_SIGNATURE = "Where's Waldo"
+    OWNER_CORPNAME = "Software Services"
+    CARBON_COPIES = []
+    DRAFTS_DIR = os.environ.get("DOCUMENT_ROOT", ".") + "/sandbox-engagements"
+    CHECKLISTS_DIR = os.environ.get("DOCUMENT_ROOT", ".") + "/sandbox-checklists"
+else:
+    ENABLE_BATCH_MODE = True
+    JS_FILE = "engagement_pipeline.js"
+    CSS_FILE = "engagement_pipeline.css"
+    ENGAGEMENT_TEMPLATE = "engagement_template.md"
+    SERVICES_TEMPLATE = "services_template.md"
+    CONSENT_SCRIPT = "consent_pipeline.cgi"
+    OWNER_EMAIL = "steve@tarrantadvisors.com"
+    OWNER_SIGNATURE = "Steve Tarrant"
+    OWNER_CORPNAME = "Managing Member - Tarrant Advisors, LLC"
+    CARBON_COPIES = ["katie@tarrantadvisors.com"]
+    DRAFTS_DIR = os.environ.get("DOCUMENT_ROOT", ".") + "/engagements"
+    CHECKLISTS_DIR = os.environ.get("DOCUMENT_ROOT", ".") + "/checklists"
+
+
+COMPANY_NAME = "Tarrant Advisors LLC"
+COMPANY_ADDR1 = "1875 Campus Commons Dr., Suite 203, Reston, VA 20191"
+COMPANY_ADDR2 = "75 Port City Landing, Suite 110, Mt. Pleasant, SC 29464"
+
+TAX_YEAR = os.environ.get("TAX_YEAR", "2026")
+NEXT_YEAR = f"{int(TAX_YEAR) + 1}"
+NEXT_NEXT_YEAR = f"{int(TAX_YEAR) + 2}"
+SCRIPT_URL = os.environ.get("SCRIPT_NAME", "")
+
+QBO_APIBASE = os.environ.get("QBO_APIBASE", "")
+QBO_REALMID = os.environ.get("QBO_REALMID", "")
+QBO_TOKEN = os.environ.get("QBO_ACCESS_TOKEN", "")
+
+ADOBE_APIBASE = os.environ.get("ADOBE_APIBASE", "")
+ADOBE_TOKEN = os.environ.get("ADOBE_ACCESS_TOKEN", "")
+
+ORGANIZATION_ENTITY_TYPES = {
+    "s_corp",
+    "partnership",
+    "c_corp",
+    "non_profit",
+    "trust",
+    "organization",
+}
+
+TAG_NEW   = "[+] "
+TAG_DRAFT = "[D] "
+TAG_FINAL = "[F] "
+
+TAX_FORM_URL= "https://forms.cloud.microsoft/r/czf2bCX6G6?r8317f2e8061f4b9e97fef60dc3ce2903"
+
+# ==========================================
+# DUPLEX REPORTLAB FLOWABLES & TEMPLATE
+# ==========================================
+
+class DuplexPageBreak(Flowable):
+    """Marker flowable processed by DuplexDocTemplate to align next content on an odd (front) page."""
+    def __init__(self):
+        super().__init__()
+        self.width = 0
+        self.height = 0
+
+    def draw(self):
+        pass
+
+class DuplexDocTemplate(SimpleDocTemplate):
+    """SimpleDocTemplate subclass supporting DuplexPageBreak for double-sided printing."""
+    def handle_flowable(self, flowables):
+        if flowables and isinstance(flowables[0], DuplexPageBreak):
+            flowables.pop(0)
+            current_page = self.canv.getPageNumber()
+            if current_page % 2 == 1:
+                # Currently on front (odd) page -> emit 2 breaks so next content starts on next front (odd) page
+                flowables.insert(0, PageBreak())
+                flowables.insert(0, Spacer(1, 1))
+                flowables.insert(0, PageBreak())
+            else:
+                # Currently on back (even) page -> 1 break lands cleanly on next front (odd) page
+                flowables.insert(0, PageBreak())
+            return
+        super().handle_flowable(flowables)
+
+def encode_questionnaire_param(qbo_id):
+    """
+    Obfuscates QBO ID using XOR secret mask and appends a Weighted Sum Modulo check digit.
+    Format: <ScrambledID>-<Checksum:02d>
+    """
+    try:
+        numeric_id = int(qbo_id)
+        scrambled_id = numeric_id ^ SECRET_MASK
+        checksum = ((numeric_id * WEIGHTED_MULTIPLIER) + WEIGHTED_OFFSET) % WEIGHTED_MODULO
+        return f"{scrambled_id}-{checksum:02d}"
+    except (ValueError, TypeError):
+        return f"{qbo_id}-00"
+
+def decode_questionnaire_param(encoded_param):
+    """
+    Inverse helper function for encode_questionnaire_param.
+
+    Parses an obfuscated parameter string formatted as <ScrambledID>-<Checksum>,
+    reverses the XOR transformation using SECRET_MASK, recalculates the Weighted Sum 
+    Modulo check digit, and returns the original QBO Customer ID string if valid. 
+    Returns None if the checksum validation fails or the input is corrupted.
+    """
+    if not encoded_param or not isinstance(encoded_param, str):
+        return None
+
+    # Handle full form URLs or raw query strings by isolating the final parameter value
+    clean_param = encoded_param.strip().split("=")[-1]
+
+    parts = clean_param.split("-")
+    if len(parts) != 2:
+        return None
+
+    scrambled_str, checksum_str = parts[0], parts[1]
+
+    try:
+        scrambled_id = int(scrambled_str)
+        provided_checksum = int(checksum_str)
+
+        # Un-XOR the scrambled ID using the symmetric secret mask
+        candidate_qbo_id = scrambled_id ^ SECRET_MASK
+
+        # Verify check digit integrity against the weighted modulo algorithm
+        expected_checksum = ((candidate_qbo_id * WEIGHTED_MULTIPLIER) + WEIGHTED_OFFSET) % WEIGHTED_MODULO
+
+        if provided_checksum == expected_checksum:
+            return str(candidate_qbo_id)
+
+        print(f"DEBUG: Checksum mismatch decoding questionnaire param '{encoded_param}'. "
+              f"Expected {expected_checksum:02d}, got {provided_checksum:02d}.", file=sys.stderr)
+        return None
+
+    except (ValueError, TypeError) as err:
+        print(f"DEBUG: Failed decoding questionnaire param '{encoded_param}': {str(err)}", file=sys.stderr)
+        return None
+
+def generate_questionnaire_url(qbo_id, base_url=TAX_FORM_URL):
+    """Generates the full pre-populated Microsoft Form URL with check-digit parameter."""
+    param_val = encode_questionnaire_param(qbo_id)
+    return f"{base_url}={param_val}"
+
+def sanitize_fee_int(raw_fee):
+    """Converts any fee input ('$1,000.00', '1000.00', 1000) directly to a clean integer."""
+    if raw_fee is None:
+        return 0
+    clean_str = str(raw_fee).replace('$', '').replace(',', '').strip()
+    if not clean_str:
+        return 0
+    try:
+        return int(round(float(clean_str)))
+    except (ValueError, TypeError):
+        return 0
+
+def get_asset_url(filename):
+    subfolder = "js" if filename.endswith(".js") else "css"
+    filepath = os.path.join(os.environ.get("DOCUMENT_ROOT", "."), subfolder, filename)
+    if os.path.exists(filepath):
+        mtime = int(os.path.getmtime(filepath))
+        return f"{filename}?v={mtime}"
+    return f"{filename}?v={int(time.time())}"
+
+def get_form_val(form, key, default=""):
+    if not form or key not in form:
+        return default
+    val = form[key]
+    if isinstance(val, list):
+        return str(val[0]) if val else default
+    return str(val) if val is not None else default
+
+def get_form_list(form, key):
+    if not form or key not in form:
+        return []
+    val = form[key]
+    if isinstance(val, list):
+        return [str(v) for v in val]
+    return [str(val)]
+
+def is_ajax_request(form):
+    header_ajax = os.environ.get("HTTP_X_REQUESTED_WITH", "").lower() == "xmlhttprequest"
+    param_ajax = get_form_val(form, "ajax", "false").lower() in ["true", "1", "yes"]
+    return header_ajax or param_ajax
+
+def render_pipeline_error(form, error_msg, http_code=400):
+    if is_ajax_request(form):
+        status_header = "400 Bad Request" if http_code == 400 else "500 Internal Server Error"
+        print(f"Status: {status_header}")
+        print("Content-Type: application/json\n")
+        print(json.dumps({"status": "error", "message": error_msg}))
+        return
+    render_phase1_workspace(error_msg=error_msg)
+
+def get_draft_file_path(qbo_id, engagement_id):
+    return os.path.join(DRAFTS_DIR, f"{qbo_id}_{engagement_id}.json")
+
+def allocate_next_engagement_id(qbo_id):
+    os.makedirs(DRAFTS_DIR, exist_ok=True)
+    existing_ids = []
+    prefix = f"{qbo_id}_"
+
+    for filename in os.listdir(DRAFTS_DIR):
+        if filename.startswith(prefix) and filename.endswith(".json"):
+            eng_part = filename[len(prefix):-5]
+            if eng_part.isdigit():
+                existing_ids.append(int(eng_part))
+
+    if not existing_ids:
+        return "1"
+    return str(max(existing_ids) + 1)
+
+def is_draft_locked(draft_path):
+    if not os.path.exists(draft_path):
+        return False, None
+    st = os.stat(draft_path)
+    is_readonly = not bool(st.st_mode & (stat.S_IWUSR | stat.S_IWGRP))
+    mtime_str = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%B %d, %Y at %I:%M %p")
+    return is_readonly, mtime_str
+
+def lock_draft(draft_path):
+    if os.path.exists(draft_path):
+        current_mode = os.stat(draft_path).st_mode
+        os.chmod(draft_path, current_mode & ~(stat.S_IWUSR | stat.S_IWGRP))
+
+def unlock_draft(draft_path):
+    if os.path.exists(draft_path):
+        current_mode = os.stat(draft_path).st_mode
+        os.chmod(draft_path, current_mode | (stat.S_IWUSR | stat.S_IWGRP))
+
+def load_exposed_services_from_template():
+    services = []
+    template_path = SERVICES_TEMPLATE
+
+    if not os.path.exists(template_path):
+        return []
+
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        raw_blocks = re.split(r'^##\s+', content, flags=re.MULTILINE)
+
+        for block in raw_blocks:
+            if not block.strip() or block.startswith('#'):
+                continue
+
+            lines = block.split('\n')
+            service_name = lines[0].strip()
+            item_id = ""
+            entity_type = "both"
+            fee_val = 0
+            notes_lines = []
+
+            for line in lines[1:]:
+                clean_line = line.strip()
+                if not clean_line:
+                    if notes_lines:
+                        notes_lines.append("")
+                    continue
+
+                id_match = re.match(r'^-\s*ID:\s*(\d+)', clean_line, re.IGNORECASE)
+                type_match = re.match(r'^-\s*Type:\s*(\w+)', clean_line, re.IGNORECASE)
+                fee_match = re.match(r'^-\s*Fee:\s*([0-9.]+)', clean_line, re.IGNORECASE)
+                migrated_match = re.match(r'^-\s*Migrates-From:\s*(\d+)', clean_line, re.IGNORECASE)
+
+                if id_match:
+                    item_id = id_match.group(1)
+                elif type_match:
+                    entity_type = type_match.group(1).lower()
+                elif fee_match:
+                    fee_val = sanitize_fee_int(fee_match.group(1))
+                elif migrated_match:
+                    continue
+                else:
+                    notes_lines.append(clean_line)
+
+            notes_text = "\n".join(notes_lines).strip() if notes_lines else ""
+            if item_id and service_name:
+                services.append({
+                    "id": item_id,
+                    "name": service_name,
+                    "type": entity_type,
+                    "fee": fee_val,
+                    "notes": notes_text
+                })
+        return sorted(services, key=lambda x: x["name"].lower())
+    except Exception as e:
+        print(f"ERROR: Failed parsing {template_path}: {str(e)}", file=sys.stderr)
+        return []
+
+EXPOSED_SERVICES = load_exposed_services_from_template()
+
+def resolve_service_line_item(item_id, svc, notes_val):
+    clean_svc = (svc or "").strip()
+    clean_item_id = str(item_id or "").strip()
+
+    # If svc is purely numeric (e.g. "19"), treat it as item_id and clear clean_svc
+    if clean_svc.isdigit():
+        if not clean_item_id:
+            clean_item_id = clean_svc
+        clean_svc = ""
+
+    # 1. Match on service name first if available
+    if clean_svc:
+        for s in EXPOSED_SERVICES:
+            if s.get("name", "").strip().lower() == clean_svc.lower():
+                if not clean_item_id:
+                    clean_item_id = str(s.get("id"))
+                if not notes_val:
+                    notes_val = s.get("notes", "")
+                return clean_item_id, clean_svc, notes_val
+
+    # 2. Fallback: Match by item_id if clean_svc was missing or not found in catalog
+    if clean_item_id:
+        for s in EXPOSED_SERVICES:
+            if str(s.get("id")) == clean_item_id:
+                if not clean_svc:
+                    clean_svc = s.get("name", "")
+                if not notes_val:
+                    notes_val = s.get("notes", "")
+                break
+
+    return clean_item_id, clean_svc, notes_val
+
+def extract_sharepoint_links_from_draft(draft_data):
+    """Extracts SharePoint URLs directly from draft JSON metadata without string scanning."""
+    if not draft_data or not isinstance(draft_data, dict):
+        return "", "", "", False
+
+    sp_meta = draft_data.get("sharepoint", {})
+    if not isinstance(sp_meta, dict):
+        sp_meta = {}
+
+    folder_url = sp_meta.get("folder_url", "").strip()
+    checklist_url = sp_meta.get("checklist_url", "").strip()
+    schedule_ce_url = sp_meta.get("schedule_ce_url", "").strip()
+
+    has_schedule_ce = bool(schedule_ce_url)
+
+    return folder_url, checklist_url, schedule_ce_url, has_schedule_ce
+
+def qbo_api_request(endpoint, method="GET", payload=None):
+    if "?" in endpoint:
+        path, query = endpoint.split("?", 1)
+        endpoint = f"{path}?{urllib.parse.quote(query, safe='=/')}"
+    else:
+        endpoint = urllib.parse.quote(endpoint, safe='/')
+
+    url = f"{QBO_APIBASE}/company/{QBO_REALMID}/{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {QBO_TOKEN}",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    data = json.dumps(payload).encode("utf-8") if payload else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        print(f"QBO API HTTP Error [{e.code}]: {error_body}", file=sys.stderr)
+        raise Exception(f"QBO API Call Failed: {error_body}")
+
+def extract_qbo_id(client_name_str):
+    if not client_name_str:
+        raise ValueError("Client selection string is empty.")
+
+    if client_name_str.isdigit():
+        return client_name_str
+
+    # 1. Match tagged format with pipe delimiter: "[D] Client Name: QBO_ID | ENG_ID: Title"
+    match_tagged_pipe = re.search(r'\[[\+\w]+\]\s*.*:\s*(\d+)\s*\|', client_name_str)
+    if match_tagged_pipe:
+        return match_tagged_pipe.group(1)
+
+    # 2. Match tagged format without pipe delimiter: "[+] Client Name: QBO_ID"
+    match_tag_simple = re.search(r'\[[\+\w]+\]\s*.*:\s*(\d+)\s*$', client_name_str)
+    if match_tag_simple:
+        return match_tag_simple.group(1)
+
+    # 3. Match labeled format: "Client Name (Customer ID: QBO_ID)"
+    match = re.search(r'(?:QBO|Customer)\s*ID:\s*(\d+)', client_name_str, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    # 4. Match leading ID format: "QBO_ID: Client Name"
+    match_alt = re.search(r'^(\d+):', client_name_str)
+    if match_alt:
+        return match_alt.group(1)
+
+    # 5. Simple "QBO_ID : Client Name" or "Client Name: QBO_ID" check
+    if ":" in client_name_str and not ("QBO ID:" in client_name_str or "Customer ID:" in client_name_str):
+        parts = client_name_str.split(":")
+        if parts[0].strip().isdigit():
+            return parts[0].strip()
+        if parts[-1].strip().isdigit():
+            return parts[-1].strip()
+
+    # 6. Fallback: Isolate DisplayName and query QBO API
+    clean_name = re.sub(r'^\[[A-Za-z0-9\+]+\]\s*', '', client_name_str)
+    clean_name = re.sub(r'\s*\((?:QBO|Customer)\s*ID:.*?\)', '', clean_name)
+    clean_name = clean_name.split(' — ')[0].split('|')[0].split(':')[0].strip()
+
+    escaped_name = clean_name.replace("'", "\\'")
+    try:
+        query_res = qbo_api_request(f"query?query=select Id from Customer where DisplayName='{escaped_name}'")
+        custs = query_res.get("QueryResponse", {}).get("Customer", [])
+        if custs:
+            return str(custs[0]["Id"])
+    except Exception:
+        pass
+
+    raise ValueError(f"Unable to parse unique Customer ID from selection: {client_name_str}")
+
+def parse_acct_num(acct_num_str):
+    meta = {
+        "entity_type": "individual",
+        "delivery_format": "electronic",
+        "friendly_name": "",
+        "primary_signer_email": "",
+        "co_signer_name": "",
+        "co_signer_email": ""
+    }
+    if not acct_num_str or not acct_num_str.strip():
+        return meta
+
+    try:
+        data = json.loads(acct_num_str.strip())
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        if isinstance(data, dict):
+            meta["entity_type"] = str(data.get("entity", "")).lower().strip()
+
+            raw_fmt = str(data.get("delivery_format", "")).lower().strip()
+            if raw_fmt in ["paper", "electronic"]:
+                meta["delivery_format"] = raw_fmt
+            else:
+                meta["delivery_format"] = "electronic"
+
+            signers = data.get("signers", [])
+            if isinstance(signers, list) and len(signers) > 0:
+                p_signer = signers[0] if isinstance(signers[0], dict) else {}
+                meta["friendly_name"] = str(p_signer.get("name", "")).strip()
+                meta["primary_signer_email"] = str(p_signer.get("email", "")).strip()
+
+                if len(signers) > 1:
+                    s_signer = signers[1] if isinstance(signers[1], dict) else {}
+                    meta["co_signer_name"] = str(s_signer.get("name", "")).strip()
+                    meta["co_signer_email"] = str(s_signer.get("email", "")).strip()
+    except Exception as e:
+        print(f"DEBUG: QBO Notes is not valid JSON or failed parsing: {str(e)}", file=sys.stderr)
+
+    return meta
+
+def compile_acct_num(friendly_name, primary_email, co_signer_name="", co_signer_email="", entity_type="individual", delivery_format="electronic"):
+    CLEAR_KEYWORDS = {"none", "null", "single", "n/a", ""}
+
+    clean_p_name = friendly_name.strip()
+    clean_p_email = primary_email.strip()
+    clean_c_name = co_signer_name.strip()
+    clean_c_email = co_signer_email.strip()
+
+    signers = [
+        {
+            "name": clean_p_name,
+            "email": clean_p_email
+        }
+    ]
+
+    has_co_name = clean_c_name.lower() not in CLEAR_KEYWORDS
+    has_co_email = clean_c_email.lower() not in CLEAR_KEYWORDS
+
+    if has_co_name or has_co_email:
+        signers.append({
+            "name": clean_c_name if has_co_name else "",
+            "email": clean_c_email if has_co_email else ""
+        })
+
+    payload = {
+        "entity": entity_type.strip().lower(),
+        "delivery_format": delivery_format.strip().lower() if delivery_format in ["paper", "electronic"] else "electronic",
+        "signers": signers
+    }
+    return json.dumps(payload)
+
+def extract_base_out_of_scope_boilerplate():
+    try:
+        with open(ENGAGEMENT_TEMPLATE, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        match = re.search(r'\{#\s*START_OUT_OF_SCOPE\s*#\}(.*?)\{#\s*END_OUT_OF_SCOPE\s*#\}', content, re.DOTALL)
+        if match:
+            raw_block = match.group(1)
+            return [
+                line.strip().lstrip('*').strip()
+                for line in raw_block.splitlines()
+                if line.strip().startswith('*')
+            ]
+    except Exception as e:
+        print(f"ERROR: Failed parsing out-of-scope items: {str(e)}", file=sys.stderr)
+
+    return []
+
+def extract_out_of_scope_dict(form, existing_draft_oos=None):
+    oos_submitted = get_form_val(form, "oos_submitted") == "true"
+
+    if not oos_submitted:
+        return existing_draft_oos
+
+    oos_dict = {}
+    for k in form:
+        if k.startswith("out_of_scope_item_") or "custom" in k:
+            val = get_form_val(form, k).strip()
+            if val:
+                oos_dict[k] = val
+
+    return oos_dict
+
+def populate_form_from_disk_draft(form, c_id, eng_id):
+    """Rehydrates form fields directly from the saved JSON draft file on disk."""
+    draft_path = get_draft_file_path(c_id, eng_id)
+    if not os.path.exists(draft_path):
+        return form
+
+    try:
+        with open(draft_path, "r", encoding="utf-8") as df:
+            disk_draft = json.load(df)
+
+        p_signer = disk_draft.get("primary_signer", {}) if isinstance(disk_draft.get("primary_signer"), dict) else {}
+        co_signer = disk_draft.get("co_signer", {}) if isinstance(disk_draft.get("co_signer"), dict) else {}
+        b_addr = disk_draft.get("billing_address", {}) if isinstance(disk_draft.get("billing_address"), dict) else {}
+
+        form["client_name"] = [str(c_id)]
+        form["engagement_id"] = [str(eng_id)]
+        form["engagement_title"] = [disk_draft.get("engagement_title", "2026 Tax Services Agreement")]
+        form["friendly_name"] = [p_signer.get("friendly_name", "")]
+        form["legal_name"] = [p_signer.get("legal_name", "")]
+        form["primary_signer_email"] = [p_signer.get("email", "")]
+        form["phone"] = [disk_draft.get("phone", "")]
+
+        form["street"] = [b_addr.get("street", "")]
+        form["city"] = [b_addr.get("city", "")]
+        form["state"] = [b_addr.get("state", "")]
+        form["zip"] = [b_addr.get("zip", "")]
+
+        form["entity_type"] = [disk_draft.get("entity_type", "individual")]
+        form["co_signer_email"] = [co_signer.get("email", "")]
+        form["co_signer_name"] = [co_signer.get("name", "")]
+
+        form["is_approved"] = ["true" if disk_draft.get("is_approved") else "false"]
+        form["reviewed_by"] = [disk_draft.get("reviewed_by", "")]
+        form["reviewed_at"] = [disk_draft.get("reviewed_at", "")]
+        form["delivery_format"] = [disk_draft.get("delivery_format", "electronic")]
+        form["questionnaire_status"] = [disk_draft.get("questionnaire_status", "unsent")]
+        form["acceptance_type"] = [disk_draft.get("acceptance_type", "")]
+
+        # Rehydrate SharePoint metadata block directly into form state
+        sp_meta = disk_draft.get("sharepoint", {}) if isinstance(disk_draft.get("sharepoint"), dict) else {}
+        form["sharepoint_folder_url"] = [sp_meta.get("folder_url", "")]
+        form["sharepoint_checklist_url"] = [sp_meta.get("checklist_url", "")]
+        form["sharepoint_schedule_ce_url"] = [sp_meta.get("schedule_ce_url", "")]
+
+        if disk_draft.get("rows"):
+            form["selected_rows"] = []
+            for idx, r in enumerate(disk_draft["rows"]):
+                rid = str(idx + 1)
+                form["selected_rows"].append(rid)
+                form[f"row_item_id_{rid}"] = [r.get("item_id", "")]
+                form[f"row_service_{rid}"] = [r.get("service", "")]
+                form[f"row_fee_{rid}"] = [sanitize_fee_int(r.get("fee", 0))]
+                form[f"row_notes_{rid}"] = [r.get("notes", "")]
+                form[f"row_bp_{rid}"] = [r.get("bp", "individual")]
+
+        if "out_of_scope_items" in disk_draft and isinstance(disk_draft["out_of_scope_items"], dict):
+            form["oos_submitted"] = ["true"]
+            for k, v in disk_draft["out_of_scope_items"].items():
+                form[k] = [v]
+    except Exception as ex:
+        print(f"DEBUG: Disk draft rehydration error for {c_id}_{eng_id}: {str(ex)}", file=sys.stderr)
+
+    return form
+
+def adobe_sign_api_request(endpoint, method="POST", payload=None, files=None, raw_response=False):
+    url = f"{ADOBE_APIBASE}/{endpoint}"
+    headers = {"Authorization": f"Bearer {ADOBE_TOKEN}"}
+
+    if payload and not files:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    elif files:
+        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        filename, mime_type, file_bytes = files
+        header_part = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="File"; filename="{filename}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode("utf-8")
+        footer_part = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        body = header_part + file_bytes + footer_part
+        headers["Content-Length"] = str(len(body))
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    else:
+        req = urllib.request.Request(url, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            if raw_response:
+                return response.read()
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        print(f"Adobe Sign HTTP Error [{e.code}]: {error_body}", file=sys.stderr)
+        raise Exception(f"Adobe Sign Call Failed: {error_body}")
+
+def submit_adobe_sign_transaction(client_qbo_id, engagement_id, estimate_id, pdf_binary_data, co_signer_email=None, is_organization=False, primary_email_override=None, primary_name_override=None, co_signer_name=None, custom_message=None, custom_subject="N/A"):
+    try:
+        primary_email = primary_email_override.strip() if primary_email_override and primary_email_override.strip() else ""
+
+        if not primary_email:
+            fresh_customer = qbo_api_request(f"customer/{client_qbo_id}").get("Customer", {})
+            raw_email = fresh_customer.get("PrimaryEmailAddr", {}).get("Address", "")
+            primary_email = raw_email.split(",")[0].strip() if raw_email else ""
+
+        if not primary_email:
+            return False, "Customer record is missing a valid Primary Email Address inside QBO and no override was provided."
+
+        files_payload = (f"Tax_Engagement_Terms_Est_{estimate_id}.pdf", "application/pdf", pdf_binary_data)
+        transient_res = adobe_sign_api_request("transientDocuments", method="POST", files=files_payload)
+        transient_id = transient_res.get("transientDocumentId")
+
+        if not transient_id:
+            return False, "Adobe Sign Gateway rejected binary buffer authentication check."
+
+        participant_sets = []
+        current_order = 1
+
+        if is_organization:
+            participant_sets.append({
+                "memberInfos": [{
+                    "email": OWNER_EMAIL,
+                    "name": OWNER_SIGNATURE
+                }],
+                "order": current_order,
+                "role": "SIGNER"
+            })
+            #current_order += 1
+
+        primary_member = {"email": primary_email}
+        if primary_name_override and primary_name_override.strip():
+            primary_member["name"] = primary_name_override.strip()
+
+        participant_sets.append({
+            "memberInfos": [primary_member],
+            "order": current_order,
+            "role": "SIGNER"
+        })
+        #current_order += 1
+
+        if co_signer_email and "@" in co_signer_email:
+            co_signer_member = {"email": co_signer_email.strip()}
+            if co_signer_name and co_signer_name.strip():
+                co_signer_member["name"] = co_signer_name.strip()
+
+            participant_sets.append({
+                "memberInfos": [co_signer_member],
+                "order": current_order,
+                "role": "SIGNER"
+            })
+
+        external_meta = { "doc_type": "Tax Agreement", "qbo_id": str(client_qbo_id), "engagement_id": str(engagement_id) }
+
+        agreement_payload = {
+            "fileInfos": [{"transientDocumentId": transient_id}],
+            "name": custom_subject,
+            "participantSetsInfo": participant_sets,
+            "externalId": {"id": json.dumps(external_meta)},
+            "signatureType": "ESIGN",
+            "state": "IN_PROCESS"
+        }
+
+        if custom_message:
+            agreement_payload["message"] = custom_message
+
+        if CARBON_COPIES:
+            agreement_payload["ccs"] = [
+                {"email": email, "label": "Executed Contract Copy"} 
+                for email in CARBON_COPIES if email.strip()
+            ]
+
+        agreement_res = adobe_sign_api_request("agreements", method="POST", payload=agreement_payload)
+        agreement_id = agreement_res.get("id")
+
+        if agreement_id:
+            return True, agreement_id
+
+        return False, "Adobe Sign accepted envelope configuration but failed to allocate an Agreement ID."
+    except Exception as ex:
+        return False, str(ex)
+
+def get_form_data():
+    form_data = {}
+    query_string = os.environ.get("QUERY_STRING", "")
+    if query_string:
+        form_data.update(urllib.parse.parse_qs(query_string))
+
+    if os.environ.get("REQUEST_METHOD", "").upper() == "POST":
+        try:
+            content_length = int(os.environ.get("CONTENT_LENGTH", 0))
+        except ValueError:
+            content_length = 0
+
+        if content_length > 0:
+            raw_body = sys.stdin.read(content_length)
+            post_data = urllib.parse.parse_qs(raw_body, keep_blank_values=True)
+            for k, v in post_data.items():
+                form_data[k] = v
+    return form_data
+
+def handle_delete_draft(form):
+    raw_client_val = get_form_val(form, "client_name")
+
+    try:
+        client_qbo_id = extract_qbo_id(raw_client_val)
+    except Exception as ex:
+        return render_pipeline_error(form, f"Cannot resolve client ID for deletion: {str(ex)}")
+
+    eng_id = get_form_val(form, "engagement_id", "0")
+    if eng_id == "0":
+        return render_pipeline_error(form, "No active draft engagement selected to delete.")
+
+    draft_path = get_draft_file_path(client_qbo_id, eng_id)
+    is_locked, _ = is_draft_locked(draft_path)
+
+    if is_locked:
+        return render_pipeline_error(form, "Cannot delete a locked or dispatched engagement.")
+
+    if os.path.exists(draft_path):
+        try:
+            os.remove(draft_path)
+        except Exception as ex:
+            return render_pipeline_error(form, f"Failed to delete draft file: {str(ex)}", http_code=500)
+
+    # Re-render clean workspace without error message after successful deletion
+    render_phase1_workspace(error_msg=None)
+
+def render_phase1_workspace(error_msg=None, preserved_form=None):
+    print("Content-Type: text/html\n")
+
+    try:
+        query_res = qbo_api_request("query?query=select * from Customer where Active=true maxresults 1000")
+        customers = query_res.get("QueryResponse", {}).get("Customer", [])
+    except Exception as e:
+        customers = []
+        error_msg = f"Failed to retrieve customer catalog from QBO. Verify tokens. Details: {str(e)}"
+
+    client_data_map = {}
+    clone_options_map = {}
+
+    os.makedirs(DRAFTS_DIR, exist_ok=True)
+
+    for c in customers:
+        c_id = str(c["Id"])
+        c_name = html.unescape(c["DisplayName"])
+        acct_num = c.get("Notes", "")
+        addr_obj = c.get("BillAddr", {})
+        raw_c_email = c.get("PrimaryEmailAddr", {}).get("Address", "")
+        qbo_primary_email = raw_c_email.split(",")[0].strip() if raw_c_email else ""
+        qbo_phone = c.get("PrimaryPhone", {}).get("FreeFormNumber", "")
+
+        meta = parse_acct_num(acct_num)
+        meta["legal_name"] = c_name
+
+        if not meta.get("friendly_name"):
+            meta["friendly_name"] = c_name
+        if not meta.get("primary_signer_email"):
+            meta["primary_signer_email"] = qbo_primary_email
+        meta["phone"] = qbo_phone
+
+        has_addr = bool(addr_obj.get("Line1") and addr_obj.get("City") and addr_obj.get("CountrySubDivisionCode") and addr_obj.get("PostalCode"))
+
+        engagements_map = {}
+
+        prefix = f"{c_id}_"
+        for filename in os.listdir(DRAFTS_DIR):
+            if filename.startswith(prefix) and filename.endswith(".json"):
+                eng_id = filename[len(prefix):-5]
+                draft_path = os.path.join(DRAFTS_DIR, filename)
+                is_locked, locked_mtime = is_draft_locked(draft_path)
+                try:
+                    with open(draft_path, "r", encoding="utf-8") as df:
+                        eng_draft = json.load(df)
+                        eng_draft["engagement_id"] = eng_id
+                        eng_draft["is_locked"] = is_locked
+                        eng_draft["locked_mtime"] = locked_mtime
+                        eng_draft["is_approved"] = eng_draft.get("is_approved", False)
+                        eng_draft["reviewed_by"] = eng_draft.get("reviewed_by", "")
+                        eng_draft["reviewed_at"] = eng_draft.get("reviewed_at", "")
+                        eng_draft["delivery_format"] = eng_draft.get("delivery_format", "electronic")
+                        eng_draft["adobe_agreement_id"] = eng_draft.get("adobe_agreement_id", "")
+                        eng_draft["adobe_completed_at"] = eng_draft.get("adobe_completed_at", "")
+                        eng_draft["questionnaire_status"] = eng_draft.get("questionnaire_status", "unsent")
+                        eng_draft["acceptance_type"] = eng_draft.get("acceptance_type", "")
+
+                        if eng_draft.get("rows"):
+                            for r in eng_draft["rows"]:
+                                r["fee"] = sanitize_fee_int(r.get("fee", 0))
+
+                        engagements_map[eng_id] = eng_draft
+
+                        if eng_draft.get("rows") and len(eng_draft["rows"]) > 0:
+                            r_count = len(eng_draft["rows"])
+                            t_fee = sum([sanitize_fee_int(r.get("fee", 0)) for r in eng_draft["rows"]])
+                            title = eng_draft.get("engagement_title", f"Engagement #{eng_id}")
+                            clone_key = f"{c_id}:{eng_id}"
+                            clone_options_map[clone_key] = f"{c_name} — {title} ({r_count} items, ${t_fee:,})"
+                except Exception:
+                    pass
+
+        client_key = f"{c_name} (Customer ID: {c_id})"
+        client_data_map[client_key] = {
+            "id": c_id,
+            "sync_token": c.get("SyncToken", ""),
+            "email": qbo_primary_email,
+            "phone": qbo_phone,
+            "metadata": meta,
+            "address": {
+                "street": addr_obj.get("Line1", ""),
+                "city": addr_obj.get("City", ""),
+                "state": addr_obj.get("CountrySubDivisionCode", ""),
+                "zip": addr_obj.get("PostalCode", "")
+            } if has_addr else {},
+            "exposed_services": EXPOSED_SERVICES,
+            "engagements": engagements_map
+        }
+
+    selected_client_label = ""
+    selected_eng_id = "0"
+    reconstructed_rows_json = "[]"
+    preserved_heal_data_json = "{}"
+    boilerplate_items = extract_base_out_of_scope_boilerplate()
+    estimate_date_option = "today"
+    sync_to_qbo_checked = True
+
+    active_oos_dict = None
+
+    if preserved_form:
+        raw_passed_client = html.unescape(get_form_val(preserved_form, "client_name"))
+        selected_eng_id = get_form_val(preserved_form, "engagement_id", "0")
+        estimate_date_option = get_form_val(preserved_form, "estimate_date_option", "next_year")
+        sync_to_qbo_val = get_form_val(preserved_form, "sync_to_qbo", "true").lower()
+        sync_to_qbo_checked = sync_to_qbo_val in ["true", "1", "yes"]
+
+        co_signer_email_val = get_form_val(preserved_form, "co_signer_email")
+        clean_co_signer_email = co_signer_email_val.strip() if "@" in co_signer_email_val else ""
+        active_oos_dict = extract_out_of_scope_dict(preserved_form)
+        is_approved_val = get_form_val(preserved_form, "is_approved", "false").lower() in ["true", "1", "yes"]
+
+        heal_data = {
+            "engagement_title": html.unescape(get_form_val(preserved_form, "engagement_title", f"{TAX_YEAR} Tax Services Agreement")),
+            "primary_signer": {
+                "friendly_name": html.unescape(get_form_val(preserved_form, "friendly_name")),
+                "legal_name": html.unescape(get_form_val(preserved_form, "legal_name")),
+                "email": get_form_val(preserved_form, "primary_signer_email")
+            },
+            "phone": get_form_val(preserved_form, "phone"),
+            "co_signer": {
+                "name": html.unescape(get_form_val(preserved_form, "co_signer_name")),
+                "email": clean_co_signer_email
+            },
+            "billing_address": {
+                "street": get_form_val(preserved_form, "street"),
+                "city": get_form_val(preserved_form, "city"),
+                "state": get_form_val(preserved_form, "state"),
+                "zip": get_form_val(preserved_form, "zip")
+            },
+            "entity_type": get_form_val(preserved_form, "entity_type", "individual"),
+            "is_approved": is_approved_val,
+            "reviewed_by": get_form_val(preserved_form, "reviewed_by", ""),
+            "reviewed_at": get_form_val(preserved_form, "reviewed_at", ""),
+            "delivery_format": get_form_val(preserved_form, "delivery_format", "electronic"),
+            "questionnaire_status": get_form_val(preserved_form, "questionnaire_status", "unsent"),
+            "acceptance_type": get_form_val(preserved_form, "acceptance_type", ""),
+            "out_of_scope_items": active_oos_dict
+        }
+        preserved_heal_data_json = json.dumps(heal_data)
+
+        selected_client_label = raw_passed_client
+        parsed_qbo_id = ""
+        try:
+            parsed_qbo_id = extract_qbo_id(raw_passed_client)
+        except Exception:
+            pass
+
+        if parsed_qbo_id:
+            for c_key, c_val in client_data_map.items():
+                if c_val["id"] == parsed_qbo_id:
+                    c_title = c_key.split(" (Customer")[0]
+                    if selected_eng_id != "0":
+                        e_draft = c_val.get("engagements", {}).get(selected_eng_id, {})
+                        e_title = e_draft.get("engagement_title") or heal_data.get("engagement_title") or f"Engagement #{selected_eng_id}"
+                        tag = TAG_FINAL if e_draft.get("is_locked") else TAG_DRAFT
+                        selected_client_label = f"{tag}{c_title}: {parsed_qbo_id} | {selected_eng_id}: {e_title}"
+                    else:
+                        selected_client_label = f"{TAG_NEW}{c_title}: {parsed_qbo_id}"
+                    break
+
+        row_ids = get_form_list(preserved_form, "selected_rows")
+        rows_list = []
+        for rid in row_ids:
+            item_id = get_form_val(preserved_form, f"row_item_id_{rid}")
+            svc = urllib.parse.unquote(get_form_val(preserved_form, f"row_service_{rid}"))
+            fee_val = get_form_val(preserved_form, f"row_fee_{rid}", "0")
+            notes_val = urllib.parse.unquote(get_form_val(preserved_form, f"row_notes_{rid}"))
+
+            item_id, svc, notes_val = resolve_service_line_item(item_id, svc, notes_val)
+
+            rows_list.append({
+                "item_id": item_id or (svc if svc.isdigit() else ""),
+                "service": svc,
+                "fee": sanitize_fee_int(fee_val),
+                "notes": notes_val
+            })
+        reconstructed_rows_json = json.dumps(rows_list)
+
+    checklist_html = '<div id="out-of-scope-checklist-container" style="background: #fafbfc; border: 1px solid #cbd5e0; border-radius: 4px; padding: 15px; margin-top: 10px;">\n'
+    checklist_html += '            <input type="hidden" name="oos_submitted" value="true">\n'
+
+    if boilerplate_items:
+        for idx, item in enumerate(boilerplate_items):
+            item_key = f"out_of_scope_item_{idx}"
+
+            if active_oos_dict is None:
+                is_checked = "checked"
+            elif isinstance(active_oos_dict, dict):
+                is_checked = "checked" if item_key in active_oos_dict else ""
+            else:
+                is_checked = "checked"
+
+            checklist_html += f"""            <div style="margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px dashed #e2e8f0;">
+                <label style="font-weight: normal; display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                    <input type="checkbox" name="{item_key}" value="{html.escape(item)}" {is_checked}>
+                    {html.escape(item)}
+                </label>
+            </div>\n"""
+
+    if isinstance(active_oos_dict, dict):
+        for k, val in active_oos_dict.items():
+            if "custom" in k:
+                checklist_html += f"""            <div class="out-of-scope-checklist-item custom-out-of-scope-item" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px dashed #e2e8f0;">
+                <label style="font-weight: normal; display: flex; align-items: center; gap: 8px; cursor: pointer; flex-grow: 1;">
+                    <input type="checkbox" name="{html.escape(k)}" value="{html.escape(val)}" checked>
+                    <span>{html.escape(val)}</span>
+                </label>
+                <button type="button" class="btn-remove-row" onclick="this.parentElement.remove()" title="Remove Custom Exclusion" style="margin-left: 10px;">×</button>
+            </div>\n"""
+
+    checklist_html += "        </div>\n"
+
+    checklist_html += """
+        <div class="add-out-of-scope-row" style="display: flex; gap: 10px; margin-top: 12px;">
+            <input type="text" id="new-out-of-scope-input" placeholder="Enter custom out-of-scope item (e.g., Prior year 1040-X amendment)..." style="flex-grow: 1; padding: 8px 12px; font-size: 13px; border: 1px solid #cbd5e0; border-radius: 4px;">
+            <button type="button" class="btn-add-row" onclick="addCustomOutOfScopeItem()" style="white-space: nowrap;">&Leftarrow; Add Out-of-Scope Item</button>
+        </div>
+        <div style="height: 12px;"></div>
+    """
+
+    batch_mode_js = "true" if ENABLE_BATCH_MODE else "false"
+
+    master_select_options = []
+    for c_key, c_val in client_data_map.items():
+        q_id = c_val["id"]
+        c_title = c_key.split(" (Customer")[0]
+        engs = c_val.get("engagements", {})
+
+        master_select_options.append(
+            f'<option value="{TAG_NEW}{html.escape(c_title)}: {q_id}" data-value="{q_id}:0"></option>'
+        )
+        for e_id, e_draft in engs.items():
+            e_title = e_draft.get("engagement_title", f"Engagement #{e_id}")
+            tag = TAG_FINAL if e_draft.get("is_locked") else TAG_DRAFT
+            master_select_options.append(
+                f'<option value="{tag}{html.escape(c_title)}: {q_id} | {e_id}: {html.escape(e_title)}" data-value="{q_id}:{e_id}"></option>'
+            )
+
+    clone_options_html = "".join([f'<option value="{html.escape(k)}">{html.escape(v)}</option>' for k, v in clone_options_map.items()])
+
+    print(f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Engagement Portal</title>
+    <link rel="stylesheet" type="text/css" href="/css/{get_asset_url(CSS_FILE)}">
+    <script>
+        window.APP_CONFIG = {{
+            "enableBatchMode": {batch_mode_js}
+        }};
+        window.clientData = {json.dumps(client_data_map)};
+        window.reconstructedRows = {reconstructed_rows_json};
+        window.preservedHealData = {preserved_heal_data_json};
+
+        document.addEventListener("DOMContentLoaded", function() {{
+            const inputEl = document.getElementById('client-select-input');
+            if (inputEl && inputEl.value) {{
+                if (typeof onClientInput === 'function') {{
+                    onClientInput();
+                }} else if (typeof onClientChange === 'function') {{
+                    onClientChange();
+                }}
+            }}
+        }});
+    </script>
+    <script src="/js/{get_asset_url(JS_FILE)}"></script>
+</head>
+<body>
+<div class="wrapper">
+    <div class="portal-nav-bar">
+        <h1>Account Engagement Portal <span style="color: orange;">{"***SANDBOX***" if PIPELINE_SANDBOX else ""}</span></h1>
+        <div class="portal-nav-links">
+            <a href="/cgi/{CONSENT_SCRIPT}" class="btn-portal-nav">🔒 Consent Portal &rarr;</a>
+            <a href="/intake.html{"?sandbox=true" if PIPELINE_SANDBOX else ""}" id="app-switch-link" class="btn-portal-nav">👤 Client Intake Hub &rarr;</a>
+        </div>
+    </div>
+
+    <div class="mode-tabs">
+        <button type="button" id="tab-btn-single" class="tab-btn active" onclick="switchWorkspaceMode('single')">👤 Single Client Agreement</button>
+        <button type="button" id="tab-btn-batch" class="tab-btn" onclick="switchWorkspaceMode('batch')">📑 Seasonal Batch Dashboard</button>
+    </div>
+
+    <div id="single-client-workspace">
+        <div id="lock-banner-container" style="display:none;"></div>
+
+        <form method="POST" action="{SCRIPT_URL}">
+            <input type="hidden" name="engagement_id" id="engagement-id-input" value="{html.escape(selected_eng_id)}">
+            <div class="form-group" style="margin-bottom: 25px;">
+                <label for="estimate-date-option">Date for Estimate:</label>
+                <select name="estimate_date_option" id="estimate-date-option" style="width: 100%; padding: 12px; font-size: 14px; border: 1px solid #ccd1d9; border-radius: 4px;">
+                    <option value="today"{" selected" if estimate_date_option == "today" else ""}>This Year</option>
+                    <option value="next_year"{" selected" if estimate_date_option == "next_year" else ""}>Next Year</option>
+                </select>
+            </div>
+
+            {f'<div style="background:#fde8e8; border:1px solid #e53e3e; color:#9b2c2c; padding:15px; margin-bottom:20px; border-radius:4px;">{html.escape(error_msg)}</div>' if error_msg else ''}
+
+            <div class="form-group">
+                <label for="client-select-input">Select Customer & Engagement:</label>
+                <input type="text" 
+                       id="client-select-input" 
+                       list="client-select-options" 
+                       value="{html.escape(selected_client_label)}"
+                       placeholder="Type or select a customer account or engagement..." 
+                       oninput="onClientInput()" 
+                       style="width: 100%; padding: 12px; font-size: 14px; border: 1px solid #ccd1d9; border-radius: 4px; box-sizing: border-box;" 
+                       required>
+                <datalist id="client-select-options">
+                    {"".join(master_select_options)}
+                </datalist>
+                <input type="hidden" name="client_name" id="client-select" value="{html.escape(selected_client_label)}">
+            </div>
+
+            <!-- Single Engagement View Approval Control Placement -->
+            <div id="single-approval-card-container" style="display:none; margin-bottom:20px;"></div>
+
+            <!-- Client Metadata Profile Container -->
+            <div id="profile-healing-container" style="display:none; margin-bottom: 25px;"></div>
+
+            <!-- QBO Sync Control Toolbar -->
+            <div id="qbo-sync-toolbar-container" class="qbo-sync-toolbar" style="display:none;">
+                <label class="qbo-sync-checkbox-label">
+                    <input type="checkbox" id="sync_to_qbo" name="sync_to_qbo" value="true" {"checked" if sync_to_qbo_checked else ""}>
+                    <span>Sync Metadata Updates to QuickBooks Online Customer Profile</span>
+                </label>
+            </div>
+
+            <table id="service-table" class="service-table" style="display:none;">
+                <thead>
+                    <tr>
+                        <th style="text-align:center;">Action</th>
+                        <th>Service Item Offering</th>
+                        <th>Proposed Amount</th>
+                        <th>Scope Specification / Notes</th>
+                    </tr>
+                </thead>
+                <tbody id="service-tbody"></tbody>
+                <tfoot>
+                    <tr style="background:#fafafa;">
+                        <td colspan="2" style="text-align:right; font-weight:700; padding:10px; color:#b76200;">Client Discount:</td>
+                        <td id="ui-total-discount" class="calc-val" style="padding:10px; text-align:right; color:#b76200;">-$0</td>
+                        <td></td>
+                    </tr>
+                    <tr class="calc-row-balance">
+                        <td colspan="2" style="text-align:right; font-weight:700; padding:10px;">TOTAL FEES:</td>
+                        <td id="ui-total-balance" class="calc-val" style="padding:10px; text-align:right;">$0</td>
+                        <td></td>
+                    </tr>
+                </tfoot>
+            </table>
+
+            <div id="actions-container" class="actions-container" style="display:none; flex-direction:column; gap:12px;">
+                <div style="display:flex; gap:10px; align-items:center;">
+                    <button type="button" class="btn-add-row" onclick="addServiceRow()">+ Add Service Line Item</button>
+                    <button type="button" class="btn-add-row btn-action-copy-trigger" onclick="toggleInlineCopyBar(true)">📋 Copy Scope & Fees from Existing Engagement...</button>
+                    <button type="submit" id="btn-delete-draft" name="action" value="delete_draft" class="btn-add-row btn-delete-draft" onclick="return confirm('Are you sure you want to permanently delete this engagement draft?');">🗑️ Delete Draft</button>
+                </div>
+
+                <div id="inline-copy-toolbar" class="inline-copy-toolbar" style="display:none;">
+                    <div style="font-weight:600; font-size:13px; color:#0078d4; margin-bottom:6px;">Copy Scope & Exclusions From Source Engagement:</div>
+                    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                        <input type="text" 
+                               id="clone-source-input" 
+                               list="clone-client-options" 
+                               placeholder="Type source customer or engagement ID to copy scope from..." 
+                               style="flex-grow:1; min-width:280px; padding:8px 12px; font-size:13px; border:1px solid #cbd5e0; border-radius:4px;">
+                        <datalist id="clone-client-options">
+                            {clone_options_html}
+                        </datalist>
+                        <button type="button" onclick="applyClonedScopeFromSource()" class="btn-submit" style="width:auto; padding:8px 16px; font-size:13px;">Apply Scope</button>
+                        <button type="button" onclick="toggleInlineCopyBar(false)" class="btn-add-row" style="padding:8px 12px; font-size:13px;">Cancel</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="out-of-scope-container" class="out-of-scope-editor-group" style="display:none;">
+                <label class="field-label" style="font-size:14px; margin-bottom:6px;">Select Applicable Out-of-Scope Services:</label>
+                {checklist_html}
+            </div>
+
+            <div class="submit-container">
+                <button type="submit" id="btn-submit-main" name="action" value="generate_preview" class="btn-submit" style="display:none;"></button>
+            </div>
+        </form>
+    </div>
+
+    <div id="batch-dashboard-workspace" style="display: none;">
+        <!-- Consolidated Single-Row Batch Toolbar -->
+        <div class="batch-toolbar-container">
+            <div class="toolbar-group-left">
+                <input type="text" id="batch-search-input" class="batch-search-input" placeholder="🔍 Search Client, Entity, QBO ID..." onkeyup="filterBatchTableGrid()">
+                <select id="batch-format-filter" class="batch-filter-select" onchange="filterBatchTableGrid()">
+                    <option value="all">All Engagements</option>
+                    <option value="not_finalized">Not Finalized</option>
+                </select>
+            </div>
+
+            <div class="toolbar-divider"></div>
+
+            <div class="toolbar-group-right">
+                <select id="batch-action-select" class="batch-action-select">
+                    <option value="submit_batch">⚡ Dispatch Selected Engagements</option>
+                    <option value="print_paper_packets">🖨️ Print Paper Packets</option>
+                    <option value="record_paper_signature">✍️ Record Paper Signature Status</option>
+                    <option value="send_adobe_reminder">🔔 Send Adobe Sign Reminder</option>
+                    <option value="email_welcome_letter">✉️ Email Welcome Letter Only</option>
+                </select>
+                <button type="button" id="btn-batch-apply-action" onclick="handleBatchActionExecution()" class="btn-batch-apply" disabled>Apply</button>
+            </div>
+        </div>
+
+        <!-- Upper Pagination Toolbar -->
+        <div class="pagination-toolbar">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <label style="font-weight: 600; color: #4a5568; white-space: nowrap; margin: 0;">Items Per Page:</label>
+                <select class="page-size-selector" onchange="setBatchPageSize(this.value)" style="padding: 4px 8px; font-size: 13px;">
+                    <option value="10" selected>10</option>
+                    <option value="25">25</option>
+                    <option value="50">50</option>
+                    <option value="all">All</option>
+                </select>
+                <span class="batch-page-info" style="color: #64748b; font-weight: 500; margin-left: 8px; white-space: nowrap; font-size: 13px;">Showing 0 engagements</span>
+            </div>
+            <div class="pagination-controls" style="display: flex; gap: 4px;">
+                <button type="button" onclick="changeBatchPage('first')" class="btn-page-nav">« First</button>
+                <button type="button" onclick="changeBatchPage('prev')" class="btn-page-nav btn-prev-page">‹ Prev</button>
+                <button type="button" onclick="changeBatchPage('next')" class="btn-page-nav btn-next-page">Next ›</button>
+                <button type="button" onclick="changeBatchPage('last')" class="btn-page-nav">Last »</button>
+            </div>
+        </div>
+
+        <table class="batch-table">
+            <thead>
+                <tr>
+                    <th style="width: 32px; text-align: center;"><input type="checkbox" id="master-batch-checkbox" onclick="toggleMasterBatchCheckbox(this.checked)" title="Select/Deselect All Visible Rows"></th>
+                    <th class="sortable-th" data-col-index="1" onclick="sortBatchTable(1)" style="width: 65px;">QBO ID<span class="sort-indicator"> ⇅</span></th>
+                    <th class="sortable-th" data-col-index="2" onclick="sortBatchTable(2)">Client / Engagement<span class="sort-indicator"> ⇅</span></th>
+                    <th class="sortable-th" data-col-index="3" onclick="sortBatchTable(3)">Class<span class="sort-indicator"> ⇅</span></th>
+                    <th class="sortable-th" data-col-index="4" onclick="sortBatchTable(4)" style="text-align: right;">Total Fee<span class="sort-indicator"> ⇅</span></th>
+                    <th class="sortable-th" data-col-index="5" onclick="sortBatchTable(5)">Questionnaire<span class="sort-indicator"> ⇅</span></th>
+                    <th class="sortable-th" data-col-index="6" onclick="sortBatchTable(6)">Format<span class="sort-indicator"> ⇅</span></th>
+                    <th class="sortable-th" data-col-index="7" onclick="sortBatchTable(7)">Status<span class="sort-indicator"> ⇅</span></th>
+                </tr>
+            </thead>
+            <tbody id="batch-tbody"></tbody>
+        </table>
+    </div>
+</div>
+
+<div id="paper-signature-modal" class="modal-overlay">
+    <div class="modal-content" style="width: 520px; max-width: 90vw;">
+        <button type="button" class="modal-close-btn" onclick="closeRecordPaperSignatureModal()">&times;</button>
+        <h3 style="margin-top: 0; color: #0078d4;">✍️ Record Paper Agreement Acceptance</h3>
+        <p style="font-size: 13px; color: #475569; margin-bottom: 15px;">
+            Select how the <strong id="paper-modal-count">0</strong> selected client(s) accepted the engagement terms:
+        </p>
+
+        <div class="modal-radio-group">
+            <label class="modal-radio-option">
+                <input type="radio" name="paper_acceptance_type" value="paper_wet_signature" checked>
+                <div class="modal-radio-text">
+                    <span class="modal-radio-title">Explicit Wet/Paper Signature</span>
+                    <span class="modal-radio-desc">Client physically signed and returned the hardcopy paper agreement.</span>
+                </div>
+            </label>
+
+            <label class="modal-radio-option">
+                <input type="radio" name="paper_acceptance_type" value="questionnaire_implicit_consent">
+                <div class="modal-radio-text">
+                    <span class="modal-radio-title">Implicit Questionnaire Sign-Off</span>
+                    <span class="modal-radio-desc">Client checked the agreement acceptance box on the digital tax organizer/questionnaire.</span>
+                </div>
+            </label>
+        </div>
+
+        <div style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
+            <button type="button" onclick="closeRecordPaperSignatureModal()" class="btn-add-row">Cancel</button>
+            <button type="button" onclick="confirmRecordPaperSignatureModal()" class="btn-submit" style="width: auto; padding: 8px 20px;">Confirm & Mark Signed</button>
+        </div>
+    </div>
+</div>
+
+<div id="batch-edit-modal" class="modal-overlay">
+    <div class="modal-content">
+        <button type="button" class="modal-close-btn" onclick="cancelBatchEditModal()">&times;</button>
+        <h2 id="modal-client-title" style="margin-top: 0; color: #0078d4;">Edit Engagement Parameters</h2>
+        <hr style="border: none; border-top: 1px solid #e2e8f0; margin-bottom: 20px;">
+
+        <div id="modal-workspace-container"></div>
+
+        <div style="margin-top: 25px; display: flex; justify-content: flex-end; gap: 12px;">
+            <button type="button" onclick="closeBatchEditModal()" class="btn-submit" style="width: auto; padding: 10px 24px;">Save & Return to Grid</button>
+        </div>
+    </div>
+</div>
+
+<div id="batch-progress-overlay" class="progress-overlay">
+    <div class="progress-card">
+        <h3 style="margin-top: 0; color: #0078d4;">Executing Batch Transaction Pipeline...</h3>
+        <div class="progress-bar-bg">
+            <div id="batch-progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <div id="batch-terminal-log" class="terminal-log">Initializing pipeline...</div>
+        <div style="margin-top: 20px; text-align: right;">
+            <button type="button" id="btn-close-progress" onclick="location.reload()" class="btn-submit" style="display: none; width: auto; padding: 10px 24px;">Done & Reload Workspace</button>
+        </div>
+    </div>
+</div>
+
+</body>
+</html>""")
+
+def handle_generate_preview(form):
+    raw_client_val = get_form_val(form, "client_name")
+    client_qbo_id = extract_qbo_id(raw_client_val)
+
+    eng_id = get_form_val(form, "engagement_id", "0")
+    if eng_id == "0":
+        eng_id = allocate_next_engagement_id(client_qbo_id)
+
+    eng_title = html.unescape(get_form_val(form, "engagement_title", "2026 Tax Services Agreement")).strip()
+
+    clean_client_title = re.sub(r'^\[[A-Za-z0-9]+\]\s*', '', html.unescape(raw_client_val))
+    clean_client_title = re.sub(r'\s*\((?:QBO|Customer)\s*ID:.*?\)', '', clean_client_title)
+    clean_client_title = clean_client_title.split(' — ')[0].split('|')[0].split(':')[0].strip()
+
+    row_ids = get_form_list(form, "selected_rows")
+    estimate_date_option = get_form_val(form, "estimate_date_option", "next_year")
+    profile_verified = get_form_val(form, "profile_verified", "false")
+    sync_to_qbo_val = get_form_val(form, "sync_to_qbo", "true").lower()
+    sync_to_qbo = sync_to_qbo_val in ["true", "1", "yes"]
+
+    co_signer_email_val = get_form_val(form, "co_signer_email")
+    co_signer_email = co_signer_email_val.strip() if "@" in co_signer_email_val else ""
+    co_signer_name = html.unescape(get_form_val(form, "co_signer_name"))
+
+    if co_signer_name.lower().strip() in ["none", "null", "single", "n/a"] or co_signer_email_val.lower().strip() in ["none", "null", "single", "n/a"]:
+        co_signer_email = co_signer_name = ""
+
+    entity_type = get_form_val(form, "entity_type", "individual")
+
+    primary_email = get_form_val(form, "primary_signer_email")
+    phone = get_form_val(form, "phone")
+    street = get_form_val(form, "street")
+    city = get_form_val(form, "city")
+    state = get_form_val(form, "state")
+    zip_val = get_form_val(form, "zip")
+
+    is_approved_val = get_form_val(form, "is_approved", "false").lower() in ["true", "1", "yes"]
+    reviewed_by_val = get_form_val(form, "reviewed_by", "").strip().upper()
+    reviewed_at_val = get_form_val(form, "reviewed_at", "").strip()
+    include_cover_letter_val = get_form_val(form, "include_cover_letter", "false")
+
+    prior_estimate_id = ""
+    existing_draft = {}
+    draft_path = get_draft_file_path(client_qbo_id, eng_id)
+    is_locked = False
+
+    try:
+        is_locked, _ = is_draft_locked(draft_path)
+        if os.path.exists(draft_path):
+            with open(draft_path, "r", encoding="utf-8") as df:
+                existing_draft = json.load(df)
+                prior_estimate_id = existing_draft.get("estimate_id", "")
+    except Exception as de:
+        print(f"DEBUG: Draft reading failure: {str(de)}", file=sys.stderr)
+
+    p_signer = existing_draft.get("primary_signer", {}) if isinstance(existing_draft.get("primary_signer"), dict) else {}
+    friendly_name = html.unescape(get_form_val(form, "friendly_name")).strip() or p_signer.get("friendly_name") or clean_client_title
+    legal_name = html.unescape(get_form_val(form, "legal_name")).strip() or p_signer.get("legal_name") or clean_client_title
+
+    if not primary_email:
+        primary_email = p_signer.get("email", "")
+
+    if not phone:
+        phone = existing_draft.get("phone", "")
+
+    if not street:
+        try:
+            fresh_c = qbo_api_request(f"customer/{client_qbo_id}").get("Customer", {})
+            c_addr = fresh_c.get("BillAddr", {})
+            if not primary_email:
+                raw_c_email = fresh_c.get("PrimaryEmailAddr", {}).get("Address", "")
+                primary_email = raw_c_email.split(",")[0].strip() if raw_c_email else ""
+            if not phone:
+                phone = fresh_c.get("PrimaryPhone", {}).get("FreeFormNumber", "")
+            street, city = c_addr.get("Line1", ""), c_addr.get("City", "")
+            state, zip_val = c_addr.get("CountrySubDivisionCode", ""), c_addr.get("PostalCode", "")
+        except Exception as fe:
+            print(f"DEBUG: QBO fallback data extraction failed: {str(fe)}", file=sys.stderr)
+
+    posted_oos_dict = extract_out_of_scope_dict(form, existing_draft.get("out_of_scope_items"))
+
+    disk_rows_list = existing_draft.get("rows", [])
+
+    processed_rows = []
+    for idx, rid in enumerate(row_ids):
+        item_id = get_form_val(form, f"row_item_id_{rid}")
+        svc = urllib.parse.unquote(get_form_val(form, f"row_service_{rid}"))
+        fee_val = get_form_val(form, f"row_fee_{rid}", "")
+        notes_val = urllib.parse.unquote(get_form_val(form, f"row_notes_{rid}"))
+        bp_val = get_form_val(form, f"row_bp_{rid}", "individual")
+
+        resolved_item_id, svc, notes_val = resolve_service_line_item(item_id, svc, notes_val)
+
+        if (fee_val is None or fee_val.strip() == "") and idx < len(disk_rows_list):
+            fee_val = disk_rows_list[idx].get("fee", 0)
+            if not notes_val:
+                notes_val = disk_rows_list[idx].get("notes", "")
+
+        processed_rows.append({
+            "item_id": item_id or (svc if svc.isdigit() else ""),
+            "service": svc,
+            "fee": sanitize_fee_int(fee_val),
+            "notes": notes_val,
+            "bp": bp_val
+        })
+
+    if not is_locked:
+        try:
+            os.makedirs(DRAFTS_DIR, exist_ok=True)
+            target_delivery_fmt = get_form_val(form, "delivery_format") or existing_draft.get("delivery_format", "electronic")
+
+            draft_payload = {
+                "engagement_id": eng_id,
+                "engagement_title": eng_title,
+                "estimate_date_option": estimate_date_option,
+                "primary_signer": {
+                    "friendly_name": friendly_name,
+                    "legal_name": legal_name,
+                    "email": primary_email
+                },
+                "phone": phone,
+                "co_signer": {
+                    "name": co_signer_name,
+                    "email": co_signer_email
+                },
+                "entity_type": entity_type,
+                "profile_verified": profile_verified.lower() in ["true", "1", "yes"],
+                "is_approved": is_approved_val,
+                "reviewed_by": reviewed_by_val if reviewed_by_val else existing_draft.get("reviewed_by", ""),
+                "reviewed_at": reviewed_at_val if reviewed_at_val else existing_draft.get("reviewed_at", ""),
+                "billing_address": {
+                    "street": street,
+                    "city": city,
+                    "state": state,
+                    "zip": zip_val
+                },
+                "sharepoint": existing_draft.get("sharepoint", {
+                    "folder_url": get_form_val(form, "sharepoint_folder_url", ""),
+                    "checklist_url": get_form_val(form, "sharepoint_checklist_url", ""),
+                    "schedule_ce_url": get_form_val(form, "sharepoint_schedule_ce_url", "")
+                }),
+                "out_of_scope_items": posted_oos_dict,
+                "estimate_id": prior_estimate_id,
+                "rows": processed_rows,
+                "delivery_format": target_delivery_fmt,
+                "adobe_agreement_id": existing_draft.get("adobe_agreement_id", ""),
+                "adobe_completed_at": existing_draft.get("adobe_completed_at", ""),
+                "questionnaire_status": existing_draft.get("questionnaire_status", "unsent"),
+                "acceptance_type": existing_draft.get("acceptance_type", "")
+            }
+            with open(draft_path, "w", encoding="utf-8") as df:
+                json.dump(draft_payload, df, indent=2)
+        except Exception as de:
+            print(f"DEBUG: Server-side draft writing handling: {str(de)}", file=sys.stderr)
+
+    iframe_src = f"{SCRIPT_URL}?action=render_live_pdf&client_name={urllib.parse.quote(client_qbo_id)}&engagement_id={eng_id}&include_cover_letter={include_cover_letter_val}"
+
+    hidden_checklist_fields = f'<input type="hidden" name="estimate_date_option" value="{html.escape(estimate_date_option)}">\n'
+    hidden_checklist_fields += '<input type="hidden" name="oos_submitted" value="true">\n'
+
+    if isinstance(posted_oos_dict, dict):
+        for k, v in posted_oos_dict.items():
+            hidden_checklist_fields += f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(v)}">\n'
+
+    email_from = OWNER_EMAIL
+
+    cc_badge_html = ""
+    if co_signer_email and "@" in co_signer_email:
+        cc_badge_html = f'<div class="email-recipient-badge" style="margin-top: -5px;">CC: <span>{html.escape(co_signer_email)}</span></div>'
+
+    # DETERMINE DELIVERY FORMAT & SUBMISSION BUTTON
+    delivery_fmt = get_form_val(form, "delivery_format") or existing_draft.get("delivery_format", "electronic")
+    is_paper_delivery = (delivery_fmt.lower() == "paper")
+
+    if is_paper_delivery:
+        submit_button_html = '<button type="submit" name="action" value="execute_transactional_pipeline_paper" class="btn-submit btn-action-lightgreen" style="text-align:center; padding:12px;">✓ Submit Agreement for Paper Signature</button>'
+    else:
+        submit_button_html = '<button type="submit" name="action" value="execute_transactional_pipeline" class="btn-submit btn-action-green" style="text-align:center; padding:12px;">⚡ Submit Agreement for Electronic Signature</button>'
+
+    print("Content-Type: text/html\n")
+    print(f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Engagement Portal</title>
+    <link rel="stylesheet" type="text/css" href="/css/{get_asset_url(CSS_FILE)}">
+    <script src="/js/{get_asset_url(JS_FILE)}"></script>
+</head>
+<body>
+<div class="split-container">
+    <div class="editor-panel" style="padding:25px; overflow-y:auto;">
+        <form method="POST" action="{SCRIPT_URL}">
+            <input type="hidden" name="client_name" value="{html.escape(raw_client_val)}">
+            <input type="hidden" name="engagement_id" value="{html.escape(eng_id)}">
+            <input type="hidden" name="engagement_title" value="{html.escape(eng_title)}">
+            <input type="hidden" name="friendly_name" value="{html.escape(friendly_name)}">
+            <input type="hidden" name="legal_name" value="{html.escape(legal_name)}">
+            <input type="hidden" name="primary_signer_email" value="{html.escape(primary_email)}">
+            <input type="hidden" name="phone" value="{html.escape(phone)}">
+            <input type="hidden" name="profile_verified" value="{html.escape(profile_verified)}">
+            <input type="hidden" name="co_signer_email" value="{html.escape(co_signer_email)}">
+            <input type="hidden" name="co_signer_name" value="{html.escape(co_signer_name)}">
+            <input type="hidden" name="entity_type" value="{html.escape(entity_type)}">
+            <input type="hidden" name="is_approved" value="{'true' if is_approved_val else 'false'}">
+            <input type="hidden" name="reviewed_by" value="{html.escape(reviewed_by_val)}">
+            <input type="hidden" name="reviewed_at" value="{html.escape(reviewed_at_val)}">
+            <input type="hidden" name="estimate_date_option" value="{html.escape(estimate_date_option)}">
+            <input type="hidden" name="sync_to_qbo" value="{'true' if sync_to_qbo else 'false'}">
+            <input type="hidden" name="prior_estimate_id" value="{html.escape(prior_estimate_id)}">
+            <input type="hidden" name="include_cover_letter" value="{html.escape(include_cover_letter_val)}">
+            <input type="hidden" name="street" value="{html.escape(street)}">
+            <input type="hidden" name="city" value="{html.escape(city)}">
+            <input type="hidden" name="state" value="{html.escape(state)}">
+            <input type="hidden" name="zip" value="{html.escape(zip_val)}">
+            {hidden_checklist_fields}
+
+            {"".join([f'<input type="hidden" name="selected_rows" value="{html.escape(rid)}">' for rid in row_ids])}
+            {"".join([f'''
+            <input type="hidden" name="row_item_id_{rid}" value="{html.escape(get_form_val(form, f"row_item_id_{rid}"))}">
+            <input type="hidden" name="row_service_{rid}" value="{html.escape(get_form_val(form, f"row_service_{rid}"))}">
+            <input type="hidden" name="row_fee_{rid}" value="{sanitize_fee_int(get_form_val(form, f"row_fee_{rid}"))}">
+            <input type="hidden" name="row_notes_{rid}" value="{html.escape(get_form_val(form, f"row_notes_{rid}"))}">
+            <input type="hidden" name="row_bp_{rid}" value="{html.escape(get_form_val(form, f"row_bp_{rid}", "individual"))}">
+            ''' for rid in row_ids])}
+
+            <div style="display:flex; flex-direction:column; gap:12px;">
+                <button type="submit" name="action" value="view_workspace" class="btn-submit btn-action-grey" style="text-align:center; padding:12px;">← Back to Engagement (Read-Only)</button>
+                <button type="submit" name="action" value="revert_to_workspace" class="btn-submit btn-action-grey" style="text-align:center; padding:12px;">✏️ Unlock Draft & Make Edits</button>
+                <button type="submit" name="action" value="download_draft_pdf" class="btn-submit btn-action-yellow" style="text-align:center; padding:12px;">⬇ Download Draft Agreement</button>
+
+                <div class="email-composer-container">
+                    <button type="button" class="btn-submit btn-action-purple" onclick="toggleEmailComposer()" style="text-align:center; padding:12px;">✉ Compose & Send Email Draft...</button>
+                    <div id="email-composer-fields" style="display:none; margin-top: 15px;">
+                        <div class="email-composer-box">
+                            <label class="field-label">From:</label>
+                            <input type="email" name="email_from" value="{html.escape(email_from)}" style="width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #cbd5e0; border-radius: 4px; box-sizing: border-box;">
+                            <div class="email-recipient-badge">To: <span>{html.escape(primary_email)}</span></div>
+                            {cc_badge_html}
+                            <label class="field-label">Subject:</label>
+                            <input type="text" name="email_subject" value="Draft Tax Engagement Agreement" style="width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #cbd5e0; border-radius: 4px; box-sizing: border-box;">
+                            <label class="field-label">Message:</label>
+                            <textarea name="email_body" style="width: 100%; height: 80px; padding: 8px; margin-bottom: 10px; border: 1px solid #cbd5e0; border-radius: 4px; box-sizing: border-box; font-family: inherit;">Please review the attached draft agreement.</textarea>
+                            <button type="submit" name="action" value="send_resend_email" class="btn-submit btn-action-purple" style="text-align:center; padding:12px; width: 100%;">🚀 Send via Resend</button>
+                        </div>
+                    </div>
+                </div>
+
+                {submit_button_html}
+            </div>
+        </form>
+    </div>
+    <div class="pdf-panel">
+        <iframe src="{html.escape(iframe_src)}"></iframe>
+    </div>
+</div>
+</body>
+</html>""")
+
+def extract_rows_from_form(form):
+    """Helper to parse and resolve service line items from CGI form inputs."""
+    row_ids = get_form_list(form, "selected_rows")
+    processed_rows = []
+    for rid in row_ids:
+        item_id = get_form_val(form, f"row_item_id_{rid}")
+        svc = urllib.parse.unquote(get_form_val(form, f"row_service_{rid}"))
+        fee_val = get_form_val(form, f"row_fee_{rid}", "0")
+        notes_val = urllib.parse.unquote(get_form_val(form, f"row_notes_{rid}"))
+        bp_val = get_form_val(form, f"row_bp_{rid}", "individual")
+
+        resolved_item_id, svc, notes_val = resolve_service_line_item(item_id, svc, notes_val)
+
+        processed_rows.append({
+            "item_id": resolved_item_id or (svc if svc.isdigit() else ""),
+            "service": svc,
+            "fee": sanitize_fee_int(fee_val),
+            "notes": notes_val,
+            "bp": bp_val
+        })
+    return processed_rows
+
+def handle_save_draft_only(form):
+    raw_client_val = get_form_val(form, "client_name")
+    client_qbo_id = extract_qbo_id(raw_client_val)
+
+    eng_id = get_form_val(form, "engagement_id", "0")
+    if eng_id == "0":
+        eng_id = allocate_next_engagement_id(client_qbo_id)
+
+    draft_path = get_draft_file_path(client_qbo_id, eng_id)
+    if is_draft_locked(draft_path)[0]:
+        return render_pipeline_error(form, "Draft is locked.", http_code=400)
+
+    # 1. Load existing draft from disk (or initialize clean dict)
+    draft = {}
+    if os.path.exists(draft_path):
+        try:
+            with open(draft_path, "r", encoding="utf-8") as df:
+                draft = json.load(df)
+        except Exception as de:
+            print(f"DEBUG: Draft reading failure: {str(de)}", file=sys.stderr)
+
+    # 2. Extract Fallback Names
+    clean_title = re.sub(r'^\[[A-Za-z0-9]+\]\s*', '', html.unescape(raw_client_val))
+    clean_title = re.sub(r'\s*\((?:QBO|Customer)\s*ID:.*?\)', '', clean_title).split(' — ')[0].split('|')[0].split(':')[0].strip()
+
+    p_signer = draft.get("primary_signer", {}) if isinstance(draft.get("primary_signer"), dict) else {}
+    friendly_name = html.unescape(get_form_val(form, "friendly_name")).strip() or p_signer.get("friendly_name") or clean_title
+    legal_name = html.unescape(get_form_val(form, "legal_name")).strip() or p_signer.get("legal_name") or clean_title
+
+    # 3. Handle Co-Signer Clearance Logic
+    co_name = html.unescape(get_form_val(form, "co_signer_name")).strip()
+    co_email = get_form_val(form, "co_signer_email").strip()
+    if co_name.lower() in ["none", "null", "single", "n/a"] or co_email.lower() in ["none", "null", "single", "n/a"]:
+        co_name = co_email = ""
+
+    # 4. Extract Line Item Rows
+    parsed_rows = extract_rows_from_form(form)
+
+    # 5. Mutate Top-Level Draft State
+    draft.update({
+        "engagement_id": eng_id,
+        "engagement_title": html.unescape(get_form_val(form, "engagement_title", "2026 Tax Services Agreement")).strip(),
+        "estimate_date_option": get_form_val(form, "estimate_date_option", "next_year"),
+        "phone": get_form_val(form, "phone") or draft.get("phone", ""),
+        "entity_type": get_form_val(form, "entity_type", "individual"),
+        "profile_verified": get_form_val(form, "profile_verified", "false").lower() in ["true", "1", "yes"],
+        "is_approved": get_form_val(form, "is_approved", "false").lower() in ["true", "1", "yes"] if "is_approved" in form else draft.get("is_approved", False),
+        "delivery_format": get_form_val(form, "delivery_format") or draft.get("delivery_format", "electronic"),
+        "out_of_scope_items": extract_out_of_scope_dict(form, draft.get("out_of_scope_items")),
+        "rows": parsed_rows if parsed_rows else draft.get("rows", [])
+    })
+
+    # 6. Mutate Nested Objects Safely
+    draft.setdefault("primary_signer", {})["friendly_name"] = friendly_name
+    draft["primary_signer"]["legal_name"] = legal_name
+    draft["primary_signer"]["email"] = get_form_val(form, "primary_signer_email") or p_signer.get("email", "")
+
+    draft.setdefault("co_signer", {})["name"] = co_name
+    draft["co_signer"]["email"] = co_email
+
+    b_addr = draft.setdefault("billing_address", {})
+    for key in ["street", "city", "state", "zip"]:
+        val = get_form_val(form, key)
+        if val:
+            b_addr[key] = val
+
+    if get_form_val(form, "reviewed_by"):
+        draft["reviewed_by"] = get_form_val(form, "reviewed_by").strip().upper()
+    if get_form_val(form, "reviewed_at"):
+        draft["reviewed_at"] = get_form_val(form, "reviewed_at").strip()
+
+    # 7. Write Mutated State to Disk
+    try:
+        with open(draft_path, "w", encoding="utf-8") as df:
+            json.dump(draft, df, indent=2)
+
+        print("Content-Type: application/json\n")
+        print(json.dumps({"status": "success", "qbo_id": client_qbo_id, "engagement_id": eng_id, "draft": draft}))
+    except Exception as e:
+        render_pipeline_error(form, str(e), http_code=500)
+
+def handle_patch_draft_only(form):
+    """Processes lightweight AJAX updates by patching specific non-empty keys into existing draft JSON on disk."""
+    raw_client_val = get_form_val(form, "client_name")
+    client_qbo_id = extract_qbo_id(raw_client_val)
+
+    eng_id = get_form_val(form, "engagement_id", "0")
+    if eng_id == "0":
+        eng_id = allocate_next_engagement_id(client_qbo_id)
+
+    draft_path = get_draft_file_path(client_qbo_id, eng_id)
+    if not os.path.exists(draft_path):
+        return render_pipeline_error(form, f"Draft file not found for Customer {client_qbo_id} / Engagement #{eng_id}.", http_code=400)
+
+    is_locked_state, _ = is_draft_locked(draft_path)
+
+    # Allow unlocking explicitly if is_locked is passed in patch request
+    if "is_locked" in form:
+        lock_param = get_form_val(form, "is_locked", "false").lower() in ["true", "1", "yes"]
+        if lock_param:
+            lock_draft(draft_path)
+        else:
+            unlock_draft(draft_path)
+        is_locked_state, _ = is_draft_locked(draft_path)
+
+    try:
+        # Temporary read to update contents safely
+        if is_locked_state:
+            unlock_draft(draft_path)
+
+        with open(draft_path, "r", encoding="utf-8") as df:
+            draft = json.load(df)
+
+        # Helper: Extract non-empty trimmed value if key exists in form
+        def get_clean_val(key):
+            if key in form:
+                val = html.unescape(get_form_val(form, key, "") or "").strip()
+                return val if val else None
+            return None
+
+        # Patch scalar fields
+        for field in ["delivery_format", "entity_type", "engagement_title", "phone", "reviewed_at", "questionnaire_status", "acceptance_type"]:
+            val = get_clean_val(field)
+            if val is not None:
+                draft[field] = val
+
+        # Upper-case reviewer initials
+        rev_by = get_clean_val("reviewed_by")
+        if rev_by is not None:
+            draft["reviewed_by"] = rev_by.upper()
+
+        # Patch boolean flags
+        if "is_approved" in form:
+            draft["is_approved"] = get_form_val(form, "is_approved", "false").lower() in ["true", "1", "yes"]
+
+        if "profile_verified" in form:
+            draft["profile_verified"] = get_form_val(form, "profile_verified", "false").lower() in ["true", "1", "yes"]
+
+        # Patch billing address sub-fields
+        if "billing_address" not in draft or not isinstance(draft["billing_address"], dict):
+            draft["billing_address"] = {}
+
+        for addr_key in ["street", "city", "state", "zip"]:
+            val = get_clean_val(addr_key)
+            if val is not None:
+                draft["billing_address"][addr_key] = val
+
+        # Patch primary signer sub-fields
+        if "primary_signer" not in draft or not isinstance(draft["primary_signer"], dict):
+            draft["primary_signer"] = {}
+
+        p_friendly = get_clean_val("friendly_name")
+        if p_friendly is not None:
+            draft["primary_signer"]["friendly_name"] = p_friendly
+
+        p_legal = get_clean_val("legal_name")
+        if p_legal is not None:
+            draft["primary_signer"]["legal_name"] = p_legal
+
+        p_email = get_clean_val("primary_signer_email")
+        if p_email is not None:
+            draft["primary_signer"]["email"] = p_email
+
+        # Patch co-signer sub-fields
+        if "co_signer" not in draft or not isinstance(draft["co_signer"], dict):
+            draft["co_signer"] = {}
+
+        c_name = get_clean_val("co_signer_name")
+        if c_name is not None:
+            draft["co_signer"]["name"] = c_name
+
+        c_email = get_clean_val("co_signer_email")
+        if c_email is not None:
+            draft["co_signer"]["email"] = c_email
+
+        # Preserve sharepoint block
+        draft["sharepoint"] = draft.get("sharepoint", {
+            "folder_url": get_form_val(form, "sharepoint_folder_url", ""),
+            "checklist_url": get_form_val(form, "sharepoint_checklist_url", ""),
+            "schedule_ce_url": get_form_val(form, "sharepoint_schedule_ce_url", "")
+        })
+
+        # Patch line item rows ONLY if row parameters were explicitly posted
+        if "selected_rows" in form or any(k.startswith("row_item_id_") or k.startswith("row_service_") for k in form):
+            draft["rows"] = extract_rows_from_form(form)
+
+        # Explicitly preserve tracking fields
+        draft["adobe_agreement_id"] = draft.get("adobe_agreement_id", "") or get_form_val(form, "adobe_agreement_id", "")
+        draft["adobe_completed_at"] = draft.get("adobe_completed_at", "") or get_form_val(form, "adobe_completed_at", "")
+
+        # Save patched draft back to disk
+        with open(draft_path, "w", encoding="utf-8") as df:
+            json.dump(draft, df, indent=2)
+
+        # Restore lock status if required
+        if "is_locked" in form and get_form_val(form, "is_locked", "false").lower() in ["true", "1", "yes"]:
+            lock_draft(draft_path)
+
+        print("Content-Type: application/json\n")
+        print(json.dumps({"status": "success", "qbo_id": client_qbo_id, "engagement_id": eng_id, "draft": draft}))
+
+    except Exception as e:
+        render_pipeline_error(form, f"Failed patching draft: {str(e)}", http_code=500)
+
+def handle_email_welcome_letter_only(form):
+    """
+    Reads Page 1 of the markdown template, evaluates Jinja variables directly from draft_data,
+    converts the rendered markdown to HTML with an inline base64 logo header using global company 
+    constants (COMPANY_NAME, COMPANY_ADDR1, COMPANY_ADDR2), and dispatches via Resend.
+    """
+    raw_client_val = get_form_val(form, "client_name")
+
+    try:
+        client_qbo_id = extract_qbo_id(raw_client_val)
+    except Exception as ex:
+        return render_pipeline_error(form, f"Cannot resolve client ID for welcome letter dispatch: {str(ex)}")
+
+    eng_id = get_form_val(form, "engagement_id", "0")
+    if eng_id == "0":
+        return render_pipeline_error(form, "No active draft engagement selected for sending welcome letter.")
+
+    draft_path = get_draft_file_path(client_qbo_id, eng_id)
+    if not os.path.exists(draft_path):
+        return render_pipeline_error(form, f"Draft file not found for Customer #{client_qbo_id} / Engagement #{eng_id}.")
+
+    # 1. Load draft data directly from disk
+    draft_data = {}
+    try:
+        with open(draft_path, "r", encoding="utf-8") as df:
+            draft_data = json.load(df)
+    except Exception as ex:
+        return render_pipeline_error(form, f"Failed reading draft JSON state: {str(ex)}", http_code=500)
+
+    # 2. Extract primary recipient and contact profile directly from draft_data
+    p_signer = draft_data.get("primary_signer", {}) if isinstance(draft_data.get("primary_signer"), dict) else {}
+    co_signer = draft_data.get("co_signer", {}) if isinstance(draft_data.get("co_signer"), dict) else {}
+    b_addr = draft_data.get("billing_address", {}) if isinstance(draft_data.get("billing_address"), dict) else {}
+
+    primary_email = p_signer.get("email", "").strip()
+    if not primary_email or "@" not in primary_email:
+        return render_pipeline_error(form, "A valid Primary Signer Email address is required to dispatch the Welcome Letter.")
+
+    friendly_name = p_signer.get("friendly_name", "").strip()
+    legal_name = p_signer.get("legal_name", "").strip() or friendly_name
+    co_signer_name = co_signer.get("name", "").strip()
+    co_signer_email = co_signer.get("email", "").strip()
+    phone = draft_data.get("phone", "").strip()
+
+    greeting_name = build_salutation_name(friendly_name, co_signer_name)
+
+    # Compile billing address string directly from draft_data
+    address_parts = [p.strip() for p in [b_addr.get("street"), b_addr.get("city"), b_addr.get("state"), b_addr.get("zip")] if p and p.strip()]
+    client_address_str = ", ".join(address_parts) if address_parts else ""
+
+    # Extract SharePoint and Questionnaire URLs
+    sp_folder_url, sp_checklist_url, sp_schedule_ce_url, has_schedule_ce = extract_sharepoint_links_from_draft(draft_data)
+    questionnaire_form_url = generate_questionnaire_url(client_qbo_id)
+
+    # 3. Base64 Encode Header Logo Image for Inline Email Display
+    logo_path = os.path.join(os.environ.get("DOCUMENT_ROOT", "."), "images", "logo.png")
+    logo_html = ""
+    if os.path.exists(logo_path):
+        try:
+            with open(logo_path, "rb") as img_f:
+                encoded_logo = base64.b64encode(img_f.read()).decode('utf-8')
+                logo_html = f'<img src="data:image/png;base64,{encoded_logo}" style="max-height: 60px; width: auto; display: block;" alt="Logo" />'
+        except Exception as img_err:
+            print(f"DEBUG: Failed base64 encoding logo image: {str(img_err)}", file=sys.stderr)
+
+    # 4. Isolate Page 1 from markdown template
+    template_path = ENGAGEMENT_TEMPLATE
+    if not os.path.exists(template_path):
+        return render_pipeline_error(form, f"Welcome letter template file not found on disk at {template_path}.", http_code=500)
+
+    try:
+        with open(template_path, "r", encoding="utf-8") as tf:
+            raw_template_content = tf.read()
+    except Exception as ex:
+        return render_pipeline_error(form, f"Failed reading template file from disk: {str(ex)}", http_code=500)
+
+    page1_markdown = raw_template_content.split("---PAGE_BREAK---")[0].strip()
+
+    # 5. Render Jinja variables into Page 1
+    rendered_markdown = Template(page1_markdown).render(
+        INCLUDE_WELCOME_LETTER=True,
+        IS_FULL_AGREEMENT=False,
+        IS_PAPER=False,
+        GREETING_NAME=greeting_name,
+        TAX_YEAR=TAX_YEAR,
+        NEXT_YEAR=NEXT_YEAR,
+        NEXT_NEXT_YEAR=NEXT_NEXT_YEAR,
+        TODAY_DATE=datetime.date.today().strftime('%B %d, %Y'),
+        FRIENDLY_NAME=friendly_name,
+        CLIENT_LEGAL_NAME=legal_name,
+        CLIENT_ADDRESS=client_address_str,
+        CLIENT_PHONE=phone,
+        QUESTIONNAIRE_FORM_URL=questionnaire_form_url,
+        SHAREPOINT_FOLDER_URL=sp_folder_url,
+        CHECKLIST_FILE_URL=sp_checklist_url,
+        SCHEDULE_CE_URL=sp_schedule_ce_url if has_schedule_ce else ""
+    )
+
+    rendered_html_content = markdown.markdown(rendered_markdown)
+
+    # 6. Wrap in Branded Email HTML Container matching PDF Header using COMPANY Constants
+    email_html_body = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; line-height: 1.5; padding: 20px; background-color: #ffffff;">
+    <div style="max-width: 680px; margin: 0 auto;">
+        <!-- Header Table Sourced from Global Constants -->
+        <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+            <tr>
+                <td style="vertical-align: top; text-align: left; width: 25%;">
+                    {logo_html}
+                </td>
+                <td style="vertical-align: top; text-align: right; width: 75%;">
+                    <div style="font-size: 18px; font-weight: bold; color: #0078d4; margin-bottom: 3px;">{html.escape(COMPANY_NAME)}</div>
+                    <div style="font-size: 11px; font-style: italic; color: #0078d4; line-height: 1.3;">
+                        {html.escape(COMPANY_ADDR1)}<br/>
+                        {html.escape(COMPANY_ADDR2)}
+                    </div>
+                </td>
+            </tr>
+        </table>
+
+        <hr style="border: none; border-top: 1px solid #e2e8f0; margin-bottom: 20px;" />
+
+        <!-- Rendered Welcome Letter Body -->
+        <div style="font-size: 14px; color: #333333;">
+            {rendered_html_content}
+        </div>
+    </div>
+</body>
+</html>"""
+
+    # 7. Configure and Dispatch via Resend API
+    email_from = get_form_val(form, "email_from", OWNER_EMAIL).strip()
+    email_subject = get_form_val(form, "email_subject") or f"Welcome to the {TAX_YEAR} Tax Season!"
+
+    resend.api_key = os.environ.get("RESEND_API_KEY")
+
+    params = {
+        "from": f"Tarrant Advisors <{email_from}>",
+        "reply_to": email_from,
+        "to": [primary_email],
+        "bcc": [email_from],
+        "subject": email_subject,
+        "html": email_html_body
+    }
+
+    if co_signer_email and "@" in co_signer_email:
+        params["cc"] = [co_signer_email]
+
+    try:
+        resend.Emails.send(params)
+    except Exception as e:
+        return render_pipeline_error(form, f"Failed to send Welcome Letter via Resend API: {str(e)}", http_code=500)
+
+    # 8. Update questionnaire status in draft JSON on disk
+    try:
+        unlock_draft(draft_path)
+        draft_data["questionnaire_status"] = "delivered"
+        with open(draft_path, "w", encoding="utf-8") as df:
+            json.dump(draft_data, df, indent=2)
+    except Exception as ex:
+        print(f"DEBUG: Error updating questionnaire_status on draft disk file: {str(ex)}", file=sys.stderr)
+
+    if is_ajax_request(form):
+        print("Content-Type: application/json\n")
+        print(json.dumps({
+            "status": "success",
+            "qbo_id": client_qbo_id,
+            "engagement_id": eng_id,
+            "recipient": primary_email,
+            "questionnaire_status": "delivered"
+        }))
+        return
+
+    # Render web confirmation view
+    success_template_src = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Welcome Letter Sent</title>
+    <link rel="stylesheet" type="text/css" href="/css/{{ css_file }}">
+</head>
+<body>
+<div class="success-wrapper">
+    <div class="success-card">
+        <div class="icon-circle" style="background:#e0f2fe; color:#0284c7;">✉</div>
+        <h2 style="margin-top: 0; color: #0078d4;">Welcome Letter Dispatched</h2>
+        <p>The welcome email with portal links was successfully sent directly to <strong>{{ primary_email }}</strong>.</p>
+        <a href="{{ script_url }}" class="btn-submit" style="background:#0078d4; text-decoration:none; display:inline-block; padding: 12px 24px; font-weight: 600;">← Return to Engagement Portal</a>
+    </div>
+</div>
+</body>
+</html>"""
+
+    success_html = Template(success_template_src).render(
+        css_file=get_asset_url(CSS_FILE),
+        primary_email=primary_email,
+        script_url=SCRIPT_URL
+    )
+
+    print("Content-Type: text/html\n")
+    print(success_html)
+
+def handle_send_adobe_reminder(form):
+    """Triggers an Adobe Sign e-signature reminder for active e-sign agreements by dynamically fetching participant IDs."""
+    raw_client_val = get_form_val(form, "client_name")
+    client_qbo_id = extract_qbo_id(raw_client_val)
+    eng_id = get_form_val(form, "engagement_id", "0")
+
+    draft_path = get_draft_file_path(client_qbo_id, eng_id)
+    adobe_agreement_id = ""
+    if os.path.exists(draft_path):
+        try:
+            with open(draft_path, "r", encoding="utf-8") as df:
+                draft = json.load(df)
+            adobe_agreement_id = draft.get("adobe_agreement_id", "")
+        except Exception:
+            pass
+
+    reminder_sent = False
+    if adobe_agreement_id:
+        try:
+            # 1. Query Adobe Sign for agreement participant details
+            members_res = adobe_sign_api_request(f"agreements/{adobe_agreement_id}/members", method="GET")
+
+            # 2. Collect IDs of active signers who have NOT signed yet
+            active_pids = []
+            participant_sets = members_res.get("participantSets", [])
+            for pset in participant_sets:
+                if pset.get("status") == "WAITING_FOR_MY_SIGNATURE":
+                    for member in pset.get("memberInfos", []):
+                        if member.get("id"):
+                            active_pids.append(member["id"])
+
+            # 3. Post the reminder with the resolved participant IDs
+            if active_pids:
+                reminder_payload = {
+                    "recipientParticipantIds": active_pids,
+                    "status": "ACTIVE"
+                }
+                adobe_sign_api_request(f"agreements/{adobe_agreement_id}/reminders", method="POST", payload=reminder_payload)
+                reminder_sent = True
+        except Exception as ex:
+            print(f"DEBUG: Adobe Sign reminder dispatch exception: {str(ex)}", file=sys.stderr)
+
+    print("Content-Type: application/json\n")
+    print(json.dumps({"status": "success", "qbo_id": client_qbo_id, "engagement_id": eng_id, "reminder_sent": reminder_sent}))
+
+def build_salutation_name(friendly_name, co_signer_name=""):
+    prefixes = ("dr.", "dr", "mr.", "mr", "mrs.", "mrs", "ms.", "ms", "prof.", "prof")
+
+    def clean_first_name(name_str):
+        if not name_str:
+            return ""
+        tokens = name_str.strip().split()
+        if tokens and tokens[0].lower() in prefixes:
+            tokens = tokens[1:]
+        return tokens[0] if tokens else ""
+
+    primary_clean = friendly_name.strip() if friendly_name else ""
+    co_signer_clean = co_signer_name.strip() if co_signer_name else ""
+
+    if " & " in primary_clean:
+        parts = primary_clean.split(" & ", 1)
+        p1 = clean_first_name(parts[0])
+        p2 = clean_first_name(parts[1])
+        return f"{p1} and {p2}" if p1 and p2 else p1
+    elif " and " in primary_clean.lower():
+        parts = re.split(r'\s+and\s+', primary_clean, flags=re.IGNORECASE, maxsplit=1)
+        p1 = clean_first_name(parts[0])
+        p2 = clean_first_name(parts[1])
+        return f"{p1} and {p2}" if p1 and p2 else p1
+
+    primary_first = clean_first_name(primary_clean)
+    co_signer_first = clean_first_name(co_signer_clean)
+
+    if primary_first and co_signer_first and primary_first.lower() != co_signer_first.lower():
+        return f"{primary_first} and {co_signer_first}"
+
+    return primary_first or primary_clean
+
+def xml_safe_escape(text):
+    if not text:
+        return ""
+    text = html.unescape(str(text))
+    text = unicodedata.normalize('NFKD', text)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Allow safe HTML tags used for styling and hyperlinks inside ReportLab Paragraphs
+    for tag in ["strong", "b", "i", "u", "a", "font"]:
+        text = re.sub(rf'&lt;({tag}\b.*?)&gt;', r'<\1>', text, flags=re.IGNORECASE)
+        text = re.sub(rf'&lt;/({tag})&gt;', r'</\1>', text, flags=re.IGNORECASE)
+
+    return text.replace("&lt;br/&gt;", "<br/>").replace("&lt;br&gt;", "<br/>")
+
+def _make_brand_header_table(styles):
+    """Builds the standard Tarrant Advisors ReportLab header table."""
+    HEADER_BLUE = colors.HexColor('#0078d4')
+    company_style = ParagraphStyle(
+        'CompanyHeader',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=18,
+        leading=22,
+        textColor=HEADER_BLUE,
+        alignment=2
+    )
+    address_style = ParagraphStyle(
+        'AddressHeader',
+        parent=styles['Normal'],
+        fontName='Helvetica-Oblique',
+        fontSize=8,
+        leading=11,
+        textColor=HEADER_BLUE,
+        alignment=2
+    )
+    header_text_nodes = [
+        Paragraph(COMPANY_NAME, company_style),
+        Spacer(1, 2),
+        Paragraph(COMPANY_ADDR1, address_style),
+        Paragraph(COMPANY_ADDR2, address_style)
+    ]
+
+    logo_path = os.environ.get("DOCUMENT_ROOT", ".") + "/images/logo.png"
+    if os.path.exists(logo_path):
+        logo_img = Image(logo_path)
+        max_w, max_h = 160.0, 60.0
+        aspect = logo_img.imageWidth / float(logo_img.imageHeight)
+        if aspect > (max_w / max_h):
+            logo_img.drawWidth = max_w
+            logo_img.drawHeight = max_w / aspect
+        else:
+            logo_img.drawHeight = max_h
+            logo_img.drawWidth = max_h * aspect
+        logo_img.hAlign = 'LEFT'
+    else:
+        logo_img = Paragraph("", styles['Normal'])
+
+    ht = Table([[logo_img, header_text_nodes]], colWidths=[160, 370])
+    ht.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('ALIGN', (0,0), (0,0), 'LEFT'),
+        ('ALIGN', (1,0), (1,0), 'RIGHT'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 10),
+    ]))
+    return ht
+
+def build_engagement_story(form, include_esign_tags=False, include_cover_letter=False, use_duplex_breaks=False):
+    """Builds the ReportLab story list for the Welcome Letter (optional) and Engagement Agreement."""
+    raw_client_name = get_form_val(form, "client_name", "Unknown Client")
+    row_ids = get_form_list(form, "selected_rows")
+    if not row_ids:
+        row_ids = [k.replace("row_item_id_", "") for k in form if k.startswith("row_item_id_")]
+
+    co_signer_email_val = get_form_val(form, "co_signer_email")
+    co_signer_email = co_signer_email_val.strip() if "@" in co_signer_email_val else ""
+    co_signer_name = html.unescape(get_form_val(form, "co_signer_name"))
+    entity_type = get_form_val(form, "entity_type", "individual")
+
+    clean_client_title = re.sub(r'^\[[A-Za-z0-9]+\]\s*', '', html.unescape(raw_client_name))
+    clean_client_title = re.sub(r'\s*\((?:QBO|Customer)\s*ID:.*?\)', '', clean_client_title)
+    clean_client_title = clean_client_title.split(' — ')[0].split('|')[0].split(':')[0].strip()
+
+    friendly_name = html.unescape(get_form_val(form, "friendly_name")).strip() or clean_client_title
+    legal_name = html.unescape(get_form_val(form, "legal_name")).strip() or clean_client_title
+
+    phone = get_form_val(form, "phone")
+    street = get_form_val(form, "street")
+    city = get_form_val(form, "city")
+    state = get_form_val(form, "state")
+    zip_val = get_form_val(form, "zip")
+
+    try:
+        c_id = extract_qbo_id(raw_client_name)
+    except Exception:
+        c_id = "0000"
+
+    eng_id = get_form_val(form, "engagement_id", "0")
+
+    # Read disk draft to retrieve explicit SharePoint metadata & delivery format
+    draft_data = {}
+    draft_path = get_draft_file_path(c_id, eng_id) if eng_id != "0" else ""
+    if draft_path and os.path.exists(draft_path):
+        try:
+            with open(draft_path, "r", encoding="utf-8") as df:
+                draft_data = json.load(df)
+        except Exception:
+            pass
+
+    sp_folder_url, sp_checklist_url, _, _ = extract_sharepoint_links_from_draft(draft_data)
+
+    # Generate pre-filled, check-digit-protected Microsoft Form Questionnaire URL
+    questionnaire_form_url = generate_questionnaire_url(c_id)
+
+    if not street or not phone:
+        try:
+            c_data = qbo_api_request(f"customer/{c_id}").get("Customer", {})
+            addr_obj = c_data.get("BillAddr", {})
+            if not street:
+                street, city = addr_obj.get('Line1',''), addr_obj.get('City','')
+                state, zip_val = addr_obj.get('CountrySubDivisionCode',''), addr_obj.get('PostalCode','')
+            if not phone:
+                phone = c_data.get("PrimaryPhone", {}).get("FreeFormNumber", "")
+        except Exception:
+            if not street: street = city = state = zip_val = ""
+            if not phone: phone = ""
+
+    address_parts = [p.strip() for p in [street, city, state, zip_val] if p and p.strip()]
+    billing_address = ", ".join(address_parts) if address_parts else "<i>[Billing Address Sourced on Execution]</i>"
+    greeting_name = build_salutation_name(friendly_name, co_signer_name)
+
+    # Check cover letter flag from parameter or form post
+    should_include_cover_letter = include_cover_letter or get_form_val(form, "include_cover_letter", "false").lower() in ["true", "1", "yes"]
+
+    # Determine delivery format for Jinja conditional rendering
+    delivery_fmt = get_form_val(form, "delivery_format") or draft_data.get("delivery_format", "electronic")
+    is_paper_delivery = (delivery_fmt.lower() == "paper")
+
+    try:
+        with open(ENGAGEMENT_TEMPLATE, "r", encoding="utf-8") as f:
+            raw_markdown = f.read()
+    except FileNotFoundError:
+        raw_markdown = ""
+
+    total_base = 0
+    discount_val = 0
+    deposit_val = 0
+    table_rows_data = [["Proposed Service Offering", "Fee Amount"]]
+    services_annotation_blocks = []
+
+    for rid in row_ids:
+        raw_svc = urllib.parse.unquote(get_form_val(form, f"row_service_{rid}", ""))
+        raw_fee_val = get_form_val(form, f"row_fee_{rid}", "")
+        notes = urllib.parse.unquote(get_form_val(form, f"row_notes_{rid}", ""))
+        item_id = get_form_val(form, f"row_item_id_{rid}", "")
+
+        _, raw_svc, notes = resolve_service_line_item(item_id, raw_svc, notes)
+
+        if not raw_svc or raw_svc.isdigit():
+            raw_svc = "Service Item"
+
+        fee = sanitize_fee_int(raw_fee_val)
+
+        svc_lower = raw_svc.lower()
+        if "discount" in svc_lower or "referral" in svc_lower:
+            discount_val += abs(fee)
+        elif "deposit" in svc_lower or "retainer" in svc_lower:
+            deposit_val += abs(fee)
+        else:
+            table_rows_data.append([raw_svc, f"${fee:,}"])
+            total_base += fee
+
+        if notes:
+            services_annotation_blocks.append(f"• <strong>{xml_safe_escape(raw_svc)}:</strong> {xml_safe_escape(notes)}")
+        else:
+            services_annotation_blocks.append(f"• <strong>{xml_safe_escape(raw_svc)}</strong>")
+
+    total_net = total_base - discount_val
+    if discount_val > 0: 
+        table_rows_data.append(["Client Discount:", f"-${discount_val:,}"])
+
+    table_rows_data.append(["TOTAL FEES:", f"${total_net:,}"])
+
+    if deposit_val > 0: 
+        table_rows_data.append(["DEPOSIT DUE UPON COMMENCEMENT OF SERVICE:", f"${deposit_val:,}"])
+
+    is_org_type = entity_type.lower() in ORGANIZATION_ENTITY_TYPES
+
+    posted_oos_dict = extract_out_of_scope_dict(form)
+
+    out_of_scope_list = list(posted_oos_dict.values()) if isinstance(posted_oos_dict, dict) else None
+
+    jinja_tmpl = Template(raw_markdown)
+    markdown_content = jinja_tmpl.render(
+        INCLUDE_WELCOME_LETTER=should_include_cover_letter,
+        IS_FULL_AGREEMENT=True,
+        IS_PAPER=is_paper_delivery,
+        SHAREPOINT_FOLDER_URL=sp_folder_url,
+        CHECKLIST_FILE_URL=sp_checklist_url,
+        QUESTIONNAIRE_FORM_URL=questionnaire_form_url,
+        TAX_YEAR=TAX_YEAR,
+        NEXT_YEAR=NEXT_YEAR,
+        NEXT_NEXT_YEAR=NEXT_NEXT_YEAR,
+        TODAY_DATE=datetime.date.today().strftime('%B %d, %Y'),
+        CLIENT_ADDRESS=billing_address,
+        CLIENT_PHONE=xml_safe_escape(phone),
+        CLIENT_LEGAL_NAME=xml_safe_escape(legal_name),
+        FRIENDLY_NAME=xml_safe_escape(friendly_name),
+        GREETING_NAME=xml_safe_escape(greeting_name),
+        meta_entity_type=entity_type.lower(),
+        out_of_scope_items=out_of_scope_list,
+        DYNAMIC_ESTIMATES_TABLE="{{DYNAMIC_ESTIMATES_TABLE}}",
+        DYNAMIC_SERVICES_TEXT="{{DYNAMIC_SERVICES_TEXT}}"
+    )
+
+    styles = getSampleStyleSheet()
+    HEADER_BLUE = colors.HexColor('#0078d4')
+
+    body_style = ParagraphStyle('CustomBody', parent=styles['Normal'], fontSize=10, leading=14, textColor=colors.HexColor('#333333'))
+    bullet_style = ParagraphStyle('CustomBullet', parent=body_style, leftIndent=24, bulletIndent=14, spaceBefore=2, spaceAfter=4)
+    list_item_style = ParagraphStyle('ListItem', parent=body_style, leftIndent=28, bulletIndent=12, spaceBefore=4, spaceAfter=3)
+    h1_style = ParagraphStyle('CustomH1', parent=styles['Heading1'], fontSize=20, leading=24, textColor=HEADER_BLUE, spaceAfter=12)
+    h2_style = ParagraphStyle('CustomH2', parent=styles['Heading2'], fontSize=14, leading=18, textColor=colors.HexColor('#111111'), spaceBefore=14, spaceAfter=8)
+
+    cell_style = ParagraphStyle('TableCell', parent=styles['Normal'], fontSize=9, leading=12, textColor=colors.HexColor('#333333'))
+    cell_bold = ParagraphStyle('TableCellBold', parent=styles['Normal'], fontSize=9, leading=12, fontName='Helvetica-Bold', textColor=colors.HexColor('#111111'))
+    cell_summary_green = ParagraphStyle('TableCellGreen', parent=styles['Normal'], fontSize=9, leading=12, fontName='Helvetica-Bold', textColor=colors.HexColor('#107c41'))
+
+    formatted_table_data = []
+    for r, row in enumerate(table_rows_data):
+        row_label = str(row[0]).upper()
+        is_green_row = row_label.startswith("TOTAL FEES") or row_label.startswith("DEPOSIT DUE")
+        formatted_table_data.append([
+            Paragraph(xml_safe_escape(str(cell)), cell_summary_green if is_green_row else (cell_bold if r == 0 else cell_style))
+            for cell in row
+        ])
+
+    story = []
+
+    filtered_lines = []
+    for line in markdown_content.split('\n'):
+        line_str = line.strip()
+        if not line_str or line_str.startswith("{%") or line_str.startswith("%}"):
+            continue
+        filtered_lines.append(line)
+
+    story.append(_make_brand_header_table(styles))
+    story.append(Spacer(1, 10))
+
+    alias_definitions = []
+
+    def build_acknowledgment_flowables(field_prefix, client_label, firm_label=None):
+        """Builds Adobe Sign short-aliased initial prompts (or [] for previews)."""
+        if not include_esign_tags and (is_paper_delivery or use_duplex_breaks):
+            return []
+
+        short_code = "w" if field_prefix == "welcome" else "a"
+
+        def init_tag(signer_num):
+            if not include_esign_tags:
+                return "[   ]"
+            alias_key = f"{short_code}{signer_num}"
+            full_field = f"{field_prefix}_es_signer{signer_num}_initials"
+            alias_definitions.append(f"{{{{#{alias_key}=*{full_field}}}}}")
+            return f"{{{{*{alias_key}}}}}"
+
+        ack_items = [Spacer(1, 6)]
+        if is_org_type:
+            if firm_label:
+                ack_items.append(Paragraph(
+                    f"{init_tag(1)} &nbsp;<strong>Firm Initials:</strong> {firm_label}",
+                    body_style
+                ))
+                ack_items.append(Spacer(1, 4))
+            ack_items.append(Paragraph(
+                f"{init_tag(2)} &nbsp;<strong>Client Initials (Required):</strong> {client_label}",
+                body_style
+            ))
+            if co_signer_email and "@" in co_signer_email:
+                ack_items.append(Spacer(1, 4))
+                ack_items.append(Paragraph(
+                    f"{init_tag(3)} &nbsp;<strong>Co-Signer Initials (Required):</strong> {client_label}",
+                    body_style
+                ))
+        else:
+            ack_items.append(Paragraph(
+                f"{init_tag(1)} &nbsp;<strong>Client Initials (Required):</strong> {client_label}",
+                body_style
+            ))
+            if co_signer_email and "@" in co_signer_email:
+                ack_items.append(Spacer(1, 4))
+                ack_items.append(Paragraph(
+                    f"{init_tag(2)} &nbsp;<strong>Co-Signer Initials (Required):</strong> {client_label}",
+                    body_style
+                ))
+        ack_items.append(Spacer(1, 8))
+        return ack_items
+
+    in_agreement_section = not should_include_cover_letter
+    welcome_ack_injected = False
+    agreement_ack_injected = False
+
+    for line in filtered_lines:
+        line_str = line.strip()
+        if not line_str or line_str.startswith("{%") or line_str.startswith("%}"):
+            continue
+
+        if line_str == "---PAGE_BREAK---":
+            in_agreement_section = True
+            if should_include_cover_letter:
+                story.append(DuplexPageBreak() if use_duplex_breaks else PageBreak())
+                story.append(_make_brand_header_table(styles))
+                story.append(Spacer(1, 10))
+            continue
+
+        # 1. Welcome Letter: Inject right before the first enumerated list item ("1. ...")
+        if not in_agreement_section and not welcome_ack_injected and re.match(r'^\d+\.\s+', line_str):
+            story.extend(build_acknowledgment_flowables(
+                field_prefix="welcome",
+                client_label="I have reviewed the welcome instructions and portal links below.",
+                firm_label=None
+            ))
+            welcome_ack_injected = True
+
+        if line_str.startswith("# "):
+            story.append(Paragraph(xml_safe_escape(line_str[2:]), h1_style))
+        elif line_str.startswith("## ") or line_str.startswith("### "):
+            # 2. Engagement Agreement: Inject right before the first ### subheading
+            if in_agreement_section and not agreement_ack_injected and line_str.startswith("### "):
+                story.extend(build_acknowledgment_flowables(
+                    field_prefix="agree",
+                    client_label="I have read and agree to the Tax Services Engagement Agreement terms below.",
+                    firm_label="Scope and fees reviewed prior to counter-signing."
+                ))
+                agreement_ack_injected = True
+            story.append(Paragraph(xml_safe_escape(re.sub(r'^#+\s*', '', line_str)), h2_style))
+        elif re.match(r'^\d+\.\s+', line_str):
+            num_match = re.match(r'^(\d+\.)\s+(.*)', line_str)
+            story.append(Paragraph(xml_safe_escape(num_match.group(2)), list_item_style, bulletText=num_match.group(1)))
+        elif re.match(r'^\*\s*', line_str):
+            bullet_content = re.sub(r'^\*\s*', '', line_str)
+            story.append(Paragraph(xml_safe_escape(bullet_content), bullet_style, bulletText='•'))
+        elif "{{DYNAMIC_ESTIMATES_TABLE}}" in line_str:
+            t = Table(formatted_table_data, colWidths=[390, 140])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#f3f4f6')),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+                ('TOPPADDING', (0,0), (-1,-1), 6),
+                ('LINEBELOW', (0,0), (-1,-1), 0.5, colors.HexColor('#e5e7eb')),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 15))
+
+        elif "{{DYNAMIC_SERVICES_TEXT}}" in line_str:
+            if services_annotation_blocks:
+                if len(services_annotation_blocks) == 1:
+                    single_block = services_annotation_blocks[0]
+                    if single_block.startswith("• "):
+                        single_block = single_block[2:]
+                    story.append(Paragraph(single_block, body_style))
+                    story.append(Spacer(1, 4))
+                else:
+                    for block in services_annotation_blocks:
+                        bullet_block = block if block.startswith("• ") else f"• {block}"
+                        story.append(Paragraph(bullet_block, body_style))
+                        story.append(Spacer(1, 4))
+            else:
+                story.append(Paragraph("<i>No specific custom exclusions logged. Standard filing scope parameters apply.</i>", body_style))
+            story.append(Spacer(1, 10))
+
+        else:
+            story.append(Paragraph(xml_safe_escape(line_str), body_style))
+            story.append(Spacer(1, 6))
+
+    def render_sig_line(label, tag, underscore_len=27):
+        return f"{label}: {tag}" if include_esign_tags else f"{label}: " + "_" * underscore_len
+
+    sig_elements = [Spacer(1, 15)]
+    signer1_label = f"<strong>{xml_safe_escape(friendly_name)}<br/>Signing on behalf of {xml_safe_escape(legal_name)}</strong>" if is_org_type else f"<strong>{xml_safe_escape(friendly_name)}</strong>"
+
+    # 1. Firm Counter-Signature (First if Organization)
+    if is_org_type:
+        sig_elements.extend([
+            Paragraph(render_sig_line("Authorized Signature", "{{_es_signer1_signature}}"), body_style),
+            Spacer(1, 4),
+            Paragraph(render_sig_line("Date Counter-Signed", "{{_es_signer1_date}}", 24), body_style),
+            Spacer(1, 4),
+            Paragraph(f"<strong>{OWNER_SIGNATURE}<br/>{OWNER_CORPNAME}</strong>", body_style),
+            Spacer(1, 15),
+        ])
+
+    # 2. Primary Client Signature
+    p_tag_idx = "2" if is_org_type else "1"
+    sig_elements.extend([
+        Paragraph(render_sig_line("Signature", f"{{{{_es_signer{p_tag_idx}_signature}}}}"), body_style),
+        Spacer(1, 4),
+        Paragraph(render_sig_line("Date Verified", f"{{{{_es_signer{p_tag_idx}_date}}}}", 24), body_style),
+        Spacer(1, 4),
+        Paragraph(signer1_label, body_style),
+    ])
+
+    # 3. Additional/Secondary Signer Signature
+    if co_signer_email and "@" in co_signer_email:
+        co_signer_label = co_signer_name.strip() if co_signer_name.strip() else co_signer_email.strip()
+        s_tag_idx = "3" if is_org_type else "2"
+
+        sig_elements.extend([
+            Spacer(1, 15),
+            Paragraph(render_sig_line("Signature", f"{{{{_es_signer{s_tag_idx}_signature}}}}"), body_style),
+            Spacer(1, 4),
+            Paragraph(render_sig_line("Date Verified", f"{{{{_es_signer{s_tag_idx}_date}}}}", 24), body_style),
+            Spacer(1, 4),
+            Paragraph(f"<strong>{xml_safe_escape(co_signer_label)}</strong>", body_style),
+        ])
+
+    story.append(KeepTogether(sig_elements))
+    if include_esign_tags and alias_definitions:
+        alias_style = ParagraphStyle('AdobeAlias', parent=styles['Normal'], fontSize=1, leading=1, textColor=colors.white)
+        story.append(Paragraph(" ".join(alias_definitions), alias_style))
+    return story
+
+def compile_reportlab_pdf_buffer(form, include_esign_tags=False, include_cover_letter=False):
+    raw_client_name = get_form_val(form, "client_name", "Unknown Client")
+    clean_client_title = re.sub(r'^\[[A-Za-z0-9]+\]\s*', '', html.unescape(raw_client_name))
+    clean_client_title = re.sub(r'\s*\((?:QBO|Customer)\s*ID:.*?\)', '', clean_client_title)
+    clean_client_title = clean_client_title.split(' — ')[0].split('|')[0].split(':')[0].strip()
+    legal_name = html.unescape(get_form_val(form, "legal_name")).strip() or clean_client_title
+
+    pdf_buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        pdf_buffer,
+        pagesize=letter,
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40,
+        title=f"{TAX_YEAR} Tax Engagement Agreement - {legal_name}"
+    )
+    story = build_engagement_story(
+        form,
+        include_esign_tags=include_esign_tags,
+        include_cover_letter=include_cover_letter,
+        use_duplex_breaks=False
+    )
+    doc.build(story)
+    pdf_buffer.seek(0)
+    return pdf_buffer
+
+def _clean_checklist_text(text):
+    if not text:
+        return ""
+    pattern = r'^(?:Please\s+)?(?:upload|provide|submit|share)(?:\s+all|\s+your|\s+us)?\s+'
+    return re.sub(pattern, '', str(text), flags=re.IGNORECASE).strip()
+
+def build_checklist_story(qbo_id, fallback_client_name="Client"):
+    """
+    Reads staged {CHECKLISTS_DIR}/{qbo_id}.json and builds ReportLab flowables
+    for the client's Tax Document Checklist. Returns empty list if no checklist exists.
+    """
+    safe_id = re.sub(r'[^a-zA-Z0-9_-]', '', str(qbo_id or ''))
+    json_path = os.path.join(CHECKLISTS_DIR, f"{safe_id}.json")
+    if not os.path.exists(json_path):
+        return []
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as ex:
+        print(f"DEBUG: Failed reading checklist JSON {json_path}: {str(ex)}", file=sys.stderr)
+        return []
+
+    checklist_obj = payload.get("checklist") if isinstance(payload.get("checklist"), dict) else payload
+    source_docs = checklist_obj.get("sourceDocuments") if isinstance(checklist_obj, dict) else []
+    if not source_docs:
+        return []
+
+    styles = getSampleStyleSheet()
+    HEADER_BLUE = colors.HexColor('#0078d4')
+    LIGHT_BG = colors.HexColor('#f8fafc')
+    ACCENT_BG = colors.HexColor('#eff6ff')
+    BORDER_GRAY = colors.HexColor('#cbd5e1')
+
+    h1_style = ParagraphStyle('ChkH1', parent=styles['Heading1'], fontSize=18, leading=22, textColor=HEADER_BLUE, spaceAfter=8)
+    h2_style = ParagraphStyle('ChkH2', parent=styles['Heading2'], fontSize=12, leading=16, textColor=HEADER_BLUE, spaceBefore=12, spaceAfter=6, keepWithNext=True)
+    body_style = ParagraphStyle('ChkBody', parent=styles['Normal'], fontSize=10, leading=14, textColor=colors.HexColor('#333333'))
+    tbl_hdr = ParagraphStyle('ChkTblHdr', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=9, textColor=colors.white)
+    tbl_cell = ParagraphStyle('ChkTblCell', parent=styles['Normal'], fontSize=9, leading=12, textColor=colors.HexColor('#1e293b'))
+    tbl_center = ParagraphStyle('ChkTblCenter', parent=tbl_cell, alignment=1)
+    tbl_right = ParagraphStyle('ChkTblRight', parent=tbl_cell, alignment=2)
+
+    client_name = str(payload.get("client_name") or fallback_client_name)
+    return_name = str(payload.get("return_name") or f"{TAX_YEAR} Tax Return")
+
+    story = []
+    story.append(_make_brand_header_table(styles))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"{TAX_YEAR} Tax Document Checklist", h1_style))
+
+    info_tbl = Table([[
+        Paragraph(f"<strong>Client:</strong> {xml_safe_escape(client_name)}", tbl_cell),
+        Paragraph(f"<strong>Return:</strong> {xml_safe_escape(return_name)}", tbl_right)
+    ]], colWidths=[310, 220])
+    info_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), ACCENT_BG),
+        ('BOX', (0, 0), (-1, -1), 0.75, BORDER_GRAY),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    story.append(info_tbl)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph(
+        "Please gather the requested tax documents listed below, check off each item as collected, "
+        "and include this checklist with your tax records.",
+        body_style
+    ))
+
+    categories = {}
+    for doc_item in source_docs:
+        if isinstance(doc_item, dict):
+            cat = str(doc_item.get("sourceDocumentType") or "OTHER").upper()
+            categories.setdefault(cat, []).append(doc_item)
+
+    item_num = 1
+    for cat_name, docs in categories.items():
+        story.append(Paragraph(f"Category: {xml_safe_escape(cat_name)}", h2_style))
+
+        rows = [[
+            Paragraph("Done", ParagraphStyle('ChkHdrC', parent=tbl_hdr, alignment=1)),
+            Paragraph("#", ParagraphStyle('NumHdrC', parent=tbl_hdr, alignment=1)),
+            Paragraph("Document Requested", tbl_hdr),
+            Paragraph("Client Notes", tbl_hdr)
+        ]]
+
+        for d in docs:
+            desc = _clean_checklist_text(d.get("text", ""))
+            rows.append([
+                Paragraph("[   ]", tbl_center),
+                Paragraph(str(item_num), tbl_center),
+                Paragraph(xml_safe_escape(desc), tbl_cell),
+                Paragraph("", tbl_cell)
+            ])
+            item_num += 1
+
+        tbl = Table(rows, colWidths=[38, 28, 334, 130], repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), HEADER_BLUE),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, LIGHT_BG]),
+            ('GRID', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 6))
+
+    return story
+
+def handle_print_paper_packets(form):
+    """
+    Compiles a single duplex-formatted batch PDF packet containing each selected engagement's:
+      1. Welcome Letter (starts on front/odd page)
+      2. Engagement Agreement (starts on front/odd page via DuplexPageBreak)
+      3. Client Tax Document Checklist from {CHECKLISTS_DIR}/{qbo_id}.json (starts on front/odd page)
+    """
+    packet_keys = get_form_list(form, "packet_keys")
+    if not packet_keys:
+        return render_pipeline_error(form, "No engagements selected for paper packet printing.", http_code=400)
+
+    master_story = []
+    valid_count = 0
+
+    for key in packet_keys:
+        if ":" not in str(key):
+            continue
+        qbo_id, eng_id = str(key).split(":", 1)
+        qbo_id = re.sub(r'[^a-zA-Z0-9_-]', '', qbo_id.strip())
+        eng_id = re.sub(r'[^a-zA-Z0-9_-]', '', eng_id.strip())
+
+        draft_path = get_draft_file_path(qbo_id, eng_id)
+        if not os.path.exists(draft_path):
+            continue
+
+        client_form = populate_form_from_disk_draft({}, qbo_id, eng_id)
+
+        if valid_count > 0:
+            master_story.append(DuplexPageBreak())
+
+        # 1. Welcome Letter + Engagement Agreement (duplex aligned, no e-sign tags)
+        eng_story = build_engagement_story(
+            client_form,
+            include_esign_tags=False,
+            include_cover_letter=True,
+            use_duplex_breaks=True
+        )
+        master_story.extend(eng_story)
+
+        # 2. Client Tax Document Checklist (duplex aligned on front page)
+        legal_name = html.unescape(get_form_val(client_form, "legal_name")).strip() or html.unescape(get_form_val(client_form, "friendly_name")).strip() or f"Client {qbo_id}"
+        checklist_story = build_checklist_story(qbo_id, fallback_client_name=legal_name)
+        if checklist_story:
+            master_story.append(DuplexPageBreak())
+            master_story.extend(checklist_story)
+
+        valid_count += 1
+
+    if valid_count == 0 or not master_story:
+        return render_pipeline_error(form, "None of the selected engagement drafts could be loaded.", http_code=404)
+
+    pdf_buffer = io.BytesIO()
+    doc = DuplexDocTemplate(
+        pdf_buffer,
+        pagesize=letter,
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40,
+        title=f"{TAX_YEAR} Tax Paper Packets"
+    )
+    doc.build(master_story)
+    pdf_bytes = pdf_buffer.getvalue()
+
+    filename = f"TA_Paper_Packets_{datetime.date.today().strftime('%Y-%m-%d')}.pdf"
+    sys.stdout.buffer.write(b"Content-Type: application/pdf\n")
+    sys.stdout.buffer.write(f"Content-Disposition: attachment; filename={urllib.parse.quote(filename)}\n\n".encode('utf-8'))
+    sys.stdout.buffer.write(pdf_bytes)
+
+def handle_render_live_pdf(form):
+    raw_client_val = get_form_val(form, "client_name")
+    eng_id = get_form_val(form, "engagement_id", "0")
+
+    if raw_client_val and eng_id != "0":
+        try:
+            c_id = extract_qbo_id(raw_client_val)
+            form = populate_form_from_disk_draft(form, c_id, eng_id)
+        except Exception as ex:
+            print(f"DEBUG: Preview disk draft read error: {str(ex)}", file=sys.stderr)
+
+    generated_buffer = compile_reportlab_pdf_buffer(form, include_esign_tags=False)
+    sys.stdout.buffer.write(b"Content-Type: application/pdf\n\n")
+    sys.stdout.buffer.write(generated_buffer.read())
+
+def handle_download_pdf(form, prefix="DRAFT"):
+    raw_client_val = get_form_val(form, "client_name", "Unknown Client")
+    eng_id = get_form_val(form, "engagement_id", "0")
+
+    if raw_client_val and eng_id != "0":
+        try:
+            c_id = extract_qbo_id(raw_client_val)
+            form = populate_form_from_disk_draft(form, c_id, eng_id)
+        except Exception as ex:
+            print(f"DEBUG: Download PDF disk draft read error: {str(ex)}", file=sys.stderr)
+
+    clean_client_title = re.sub(r'^\[[A-Za-z0-9]+\]\s*', '', html.unescape(raw_client_val))
+    clean_client_title = re.sub(r'\s*\((?:QBO|Customer)\s*ID:.*?\)', '', clean_client_title)
+    clean_client_title = clean_client_title.split(' — ')[0].split('|')[0].split(':')[0].strip()
+
+    legal_name = html.unescape(get_form_val(form, "legal_name")).strip() or clean_client_title
+
+    timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+    filename = f"Tax Agreement {legal_name} ({prefix} {timestamp_str}).pdf"
+    generated_buffer = compile_reportlab_pdf_buffer(form, include_esign_tags=False)
+
+    sys.stdout.buffer.write(b"Content-Type: application/pdf\n")
+    sys.stdout.buffer.write(f"Content-Disposition: attachment; filename={urllib.parse.quote(filename)}\n\n".encode('utf-8'))
+    sys.stdout.buffer.write(generated_buffer.read())
+
+def handle_view_signed_pdf(form):
+    raw_client_val = get_form_val(form, "client_name")
+    eng_id = get_form_val(form, "engagement_id", "0")
+    if not raw_client_val or eng_id == "0":
+        return render_pipeline_error(form, "Missing client selection or engagement ID for signed document viewing.", http_code=400)
+
+    try:
+        c_id = extract_qbo_id(raw_client_val)
+    except Exception as ex:
+        return render_pipeline_error(form, f"Unable to resolve customer ID: {str(ex)}", http_code=400)
+
+    draft_path = get_draft_file_path(c_id, eng_id)
+    if not os.path.exists(draft_path):
+        return render_pipeline_error(form, f"Draft file not found for Customer #{c_id} / Engagement #{eng_id}.", http_code=404)
+
+    try:
+        with open(draft_path, "r", encoding="utf-8") as df:
+            draft = json.load(df)
+
+        adobe_agreement_id = draft.get("adobe_agreement_id")
+        if not adobe_agreement_id:
+            return render_pipeline_error(form, f"No Adobe Agreement ID recorded for Customer #{c_id} / Engagement #{eng_id}.", http_code=400)
+
+        pdf_bytes = adobe_sign_api_request(f"agreements/{adobe_agreement_id}/combinedDocument", method="GET", raw_response=True)
+
+        legal_name = draft.get("primary_signer", {}).get("legal_name") or f"Customer_{c_id}"
+        filename = f"Signed_Tax_Agreement_{legal_name.replace(' ', '_')}.pdf"
+
+        sys.stdout.buffer.write(b"Content-Type: application/pdf\n")
+        sys.stdout.buffer.write(f"Content-Disposition: inline; filename={urllib.parse.quote(filename)}\n\n".encode('utf-8'))
+        sys.stdout.buffer.write(pdf_bytes)
+    except Exception as ex:
+        render_pipeline_error(form, f"Failed retrieving signed document from Adobe Sign: {str(ex)}", http_code=500)
+
+def handle_send_resend_email(form):
+    raw_client_val = get_form_val(form, "client_name")
+    eng_id = get_form_val(form, "engagement_id", "0")
+    client_qbo_id = extract_qbo_id(raw_client_val)
+
+    posted_subject = get_form_val(form, "email_subject")
+    posted_body = get_form_val(form, "email_body")
+    email_from = get_form_val(form, "email_from", OWNER_EMAIL).strip()
+
+    if raw_client_val and eng_id != "0":
+        try:
+            form = populate_form_from_disk_draft(form, client_qbo_id, eng_id)
+        except Exception as ex:
+            print(f"DEBUG: Resend Email disk draft read error: {str(ex)}", file=sys.stderr)
+
+    primary_email = get_form_val(form, "primary_signer_email")
+    if not primary_email:
+        p_signer = form.get("primary_signer", {})
+        if isinstance(p_signer, dict):
+            primary_email = p_signer.get("email", "")
+
+    email_subject = posted_subject or get_form_val(form, "email_subject", "Draft Tax Engagement Agreement")
+    email_body = posted_body or get_form_val(form, "email_body", "Please review the attached draft agreement.")
+
+    clean_client_title = re.sub(r'^\[[A-Za-z0-9]+\]\s*', '', html.unescape(raw_client_val))
+    clean_client_title = re.sub(r'\s*\((?:QBO|Customer)\s*ID:.*?\)', '', clean_client_title)
+    clean_client_title = clean_client_title.split(' — ')[0].split('|')[0].split(':')[0].strip()
+
+    legal_name = html.unescape(get_form_val(form, "legal_name")).strip() or clean_client_title
+
+    pdf_buffer = compile_reportlab_pdf_buffer(form, include_esign_tags=False)
+    pdf_bytes = pdf_buffer.read()
+    filename = f"Draft_Agreement_{legal_name.replace(' ', '_')}.pdf"
+
+    resend.api_key = os.environ.get("RESEND_API_KEY")
+
+    params = {
+        "from": f"Tarrant Advisors <{email_from}>",
+        "reply_to": email_from,
+        "to": [primary_email],
+        "bcc": [email_from],
+        "subject": email_subject,
+        "text": email_body,
+        "attachments": [
+            {
+                "filename": filename,
+                "content": list(pdf_bytes),
+            }
+        ]
+    }
+
+    co_signer_email = get_form_val(form, "co_signer_email").strip()
+    if co_signer_email and "@" in co_signer_email:
+        params["cc"] = [co_signer_email]
+
+    try:
+        resend.Emails.send(params)
+    except Exception as e:
+        return render_pipeline_error(form, f"Failed to send email via Resend API: {str(e)}")
+
+    success_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Draft Email Dispatched Successfully</title>
+    <link rel="stylesheet" type="text/css" href="/css/{get_asset_url(CSS_FILE)}">
+</head>
+<body>
+<div class="success-wrapper">
+    <div class="success-card">
+        <div class="icon-circle">✉</div>
+        <h2 style="margin-top: 0; color: #107c41;">Email Sent Successfully</h2>
+        <p>The draft agreement was successfully emailed to <strong>{html.escape(primary_email)}</strong> via Resend.</p>
+        <a href="{SCRIPT_URL}?action=view_workspace" class="btn-submit" style="background:#0078d4; text-decoration:none; display:inline-block; padding: 12px 24px; font-weight: 600;">← Return to Engagement Portal</a>
+    </div>
+</div>
+</body>
+</html>"""
+
+    print("Content-Type: text/html\n")
+    print(success_html)
+
+def execute_transactional_pipeline(form):
+    raw_client_val = get_form_val(form, "client_name")
+    client_qbo_id = extract_qbo_id(raw_client_val)
+
+    eng_id = get_form_val(form, "engagement_id", "0")
+    if eng_id == "0":
+        eng_id = allocate_next_engagement_id(client_qbo_id)
+
+    draft_path = get_draft_file_path(client_qbo_id, eng_id)
+    is_approved_check = get_form_val(form, "is_approved", "false").lower() in ["true", "1", "yes"]
+
+    if not is_approved_check and os.path.exists(draft_path):
+        try:
+            with open(draft_path, "r", encoding="utf-8") as df:
+                disk_draft_check = json.load(df)
+                is_approved_check = disk_draft_check.get("is_approved", False)
+        except Exception:
+            pass
+
+    # Single Engagement manual preview submissions bypass the approval gate automatically
+    if not is_ajax_request(form):
+        is_approved_check = True
+
+    if not is_approved_check and not is_draft_locked(draft_path)[0]:
+        return render_pipeline_error(form, "Pipeline Execution Halted: Engagement must be reviewed and approved before dispatch.")
+
+    eng_title = html.unescape(get_form_val(form, "engagement_title", "2026 Tax Services Agreement")).strip()
+    row_ids = get_form_list(form, "selected_rows")
+    friendly_name = get_form_val(form, "friendly_name")
+    legal_name = get_form_val(form, "legal_name")
+    primary_email = get_form_val(form, "primary_signer_email")
+    phone = get_form_val(form, "phone")
+    street = get_form_val(form, "street")
+    city = get_form_val(form, "city")
+    state = get_form_val(form, "state")
+    zip_val = get_form_val(form, "zip")
+    estimate_date_option = get_form_val(form, "estimate_date_option", "next_year")
+    sync_to_qbo_val = get_form_val(form, "sync_to_qbo", "true").lower()
+    sync_to_qbo = sync_to_qbo_val in ["true", "1", "yes"]
+
+    co_signer_email_val = get_form_val(form, "co_signer_email")
+    co_signer_email = co_signer_email_val.strip() if "@" in co_signer_email_val else ""
+    co_signer_name = html.unescape(get_form_val(form, "co_signer_name"))
+    entity_type = get_form_val(form, "entity_type", "individual")
+
+    delivery_method = get_form_val(form, "delivery_method")
+    is_paper_mode = (delivery_method == "paper")
+    is_org_type = entity_type.lower() in ORGANIZATION_ENTITY_TYPES
+
+    prior_estimate_id = get_form_val(form, "prior_estimate_id").strip()
+    draft_path = get_draft_file_path(client_qbo_id, eng_id)
+
+    existing_draft_format = ""
+    if os.path.exists(draft_path):
+        try:
+            with open(draft_path, "r", encoding="utf-8") as df:
+                disk_draft = json.load(df)
+                existing_draft_format = disk_draft.get("delivery_format", "")
+                if not prior_estimate_id:
+                    prior_estimate_id = str(disk_draft.get("estimate_id", "")).strip()
+                if not primary_email:
+                    p_signer = disk_draft.get("primary_signer", {}) if isinstance(disk_draft.get("primary_signer"), dict) else {}
+                    primary_email = p_signer.get("email", "")
+                if not phone:
+                    phone = disk_draft.get("phone", "")
+        except Exception as e:
+            print(f"DEBUG: Could not read prior estimate ID, phone, or email from draft: {e}", file=sys.stderr)
+
+    if prior_estimate_id:
+        try:
+            prior_txn = qbo_api_request(f"estimate/{prior_estimate_id}").get("Estimate", {})
+            prior_customer_id = str(prior_txn.get("CustomerRef", {}).get("value", ""))
+            prior_sync_token = prior_txn.get("SyncToken")
+
+            if prior_customer_id == str(client_qbo_id) and prior_sync_token:
+                qbo_api_request("estimate?operation=delete", method="POST", payload={
+                    "Id": prior_estimate_id, 
+                    "SyncToken": prior_sync_token
+                })
+                print(f"DEBUG: Deleted superseded Estimate #{prior_estimate_id} for Customer {client_qbo_id}", file=sys.stderr)
+        except Exception as rollback_err:
+            print(f"Warning: Could not wipe prior Estimate #{prior_estimate_id}: {str(rollback_err)}", file=sys.stderr)
+
+    try:
+        fresh_customer = qbo_api_request(f"customer/{client_qbo_id}").get("Customer", {})
+    except Exception as e:
+        return render_pipeline_error(form, f"Pipeline Execution Halted: Unable to verify Customer record from QBO. ({str(e)})")
+
+    raw_primary_email = fresh_customer.get("PrimaryEmailAddr", {}).get("Address", "")
+    qbo_primary_email = raw_primary_email.split(",")[0].strip() if raw_primary_email else ""
+    effective_primary_email = primary_email.strip() if primary_email and primary_email.strip() else qbo_primary_email
+
+    qbo_phone = fresh_customer.get("PrimaryPhone", {}).get("FreeFormNumber", "")
+    effective_phone = phone.strip() if phone and phone.strip() else qbo_phone
+
+    # Preserve format baseline from QBO Notes or disk draft during sync
+    existing_qbo_meta = parse_acct_num(fresh_customer.get("Notes", ""))
+    target_qbo_format = get_form_val(form, "delivery_format") or existing_draft_format or existing_qbo_meta.get("delivery_format") or "electronic"
+
+    proposed_notes_json = compile_acct_num(
+        friendly_name=friendly_name,
+        primary_email=effective_primary_email,
+        co_signer_name=co_signer_name,
+        co_signer_email=co_signer_email,
+        entity_type=entity_type,
+        delivery_format=target_qbo_format
+    )
+
+    if sync_to_qbo:
+        try:
+            company_name_val = None if entity_type.lower() == "individual" else legal_name
+
+            patch_payload = {
+                "Id": client_qbo_id,
+                "SyncToken": fresh_customer["SyncToken"],
+                "sparse": True,
+                "DisplayName": legal_name,
+                "CompanyName": company_name_val,
+                "PrimaryEmailAddr": {
+                    "Address": effective_primary_email
+                },
+                "PrimaryPhone": {
+                    "FreeFormNumber": effective_phone
+                },
+                "BillAddr": {
+                    "Line1": street,
+                    "City": city,
+                    "CountrySubDivisionCode": state,
+                    "PostalCode": zip_val
+                },
+                "Notes": proposed_notes_json
+            }
+            qbo_api_request("customer", method="POST", payload=patch_payload)
+        except Exception as e:
+            return render_pipeline_error(form, f"QBO Customer Profile Sync Failure: Unable to update Customer record in QBO. ({str(e)})")
+
+    estimate_lines = []
+    deposit_val = 0
+    total_fee_sum = 0
+
+    disk_rows_list = []
+    if os.path.exists(draft_path):
+        try:
+            with open(draft_path, "r", encoding="utf-8") as df:
+                disk_draft = json.load(df)
+                disk_rows_list = disk_draft.get("rows", [])
+        except Exception:
+            pass
+
+    for idx, rid in enumerate(row_ids):
+        item_id = get_form_val(form, f"row_item_id_{rid}")
+        svc_name = urllib.parse.unquote(get_form_val(form, f"row_service_{rid}", "Service Listing"))
+        raw_fee_val = get_form_val(form, f"row_fee_{rid}", "")
+        notes = urllib.parse.unquote(get_form_val(form, f"row_notes_{rid}"))
+
+        item_id, svc_name, notes = resolve_service_line_item(item_id, svc_name, notes)
+
+        if (raw_fee_val is None or raw_fee_val.strip() == "") and idx < len(disk_rows_list):
+            raw_fee_val = disk_rows_list[idx].get("fee", 0)
+            if not notes:
+                notes = disk_rows_list[idx].get("notes", "")
+
+        fee = sanitize_fee_int(raw_fee_val)
+
+        svc_lower = svc_name.lower()
+        if item_id == "00000" or "deposit" in svc_lower or "retainer" in svc_lower:
+            deposit_val += abs(fee)
+            continue 
+
+        if "discount" in svc_lower or "referral" in svc_lower:
+            fee = -abs(fee)
+
+        total_fee_sum += fee
+
+        description = f"{svc_name} | Scope: {notes}" if notes else svc_name
+        estimate_lines.append({
+            "Description": description,
+            "Amount": fee,
+            "DetailType": "SalesItemLineDetail",
+            "SalesItemLineDetail": {
+                "ItemRef": {"value": item_id},
+                "UnitPrice": fee,
+                "Qty": 1
+            }
+        })
+
+    if not estimate_lines:
+        return render_pipeline_error(form, "Pipeline Halted: Add at least one Service Line Item before submitting.")
+
+    estimate_payload = {
+        "CustomerRef": {"value": client_qbo_id},
+        "TxnStatus": "Accepted",
+        "AutoDocNumber": True,
+        "Line": estimate_lines,
+        "CustomField": [{"DefinitionId": "1", "StringValue": "JOINT" if (co_signer_email and "@" in co_signer_email) else "SINGLE", "Name": "Signers"}]
+    }
+
+    if deposit_val > 0:
+        estimate_payload["PrivateNote"] = f"Deposit Due: ${deposit_val:,}"
+
+    if estimate_date_option == "next_year":
+        next_year = datetime.date.today().year + 1
+        estimate_payload["TxnDate"] = f"{next_year}-01-01"
+
+    try:
+        qbo_response = qbo_api_request("estimate", method="POST", payload=estimate_payload)
+        generated_estimate = qbo_response.get("Estimate", {})
+        estimate_id = generated_estimate.get("Id")
+        sync_token = generated_estimate.get("SyncToken")
+    except Exception as e:
+        return render_pipeline_error(form, f"QuickBooks Error: Failed to generate transaction record. ({str(e)})")
+
+    live_pdf_buffer = compile_reportlab_pdf_buffer(form, include_esign_tags=not is_paper_mode)
+    live_pdf_buffer.seek(0)
+
+    include_welcome_letter = get_form_val(form, "include_cover_letter", "false").lower() in ["true", "1", "yes"]
+    if is_ajax_request(form) or include_welcome_letter:
+        adobe_email_subject = f"Welcome to the {TAX_YEAR} Tax Season!"
+        adobe_email_message = (
+            f"Dear {friendly_name},\n\n"
+            f"Welcome to the {TAX_YEAR} tax preparation season! We have prepared a welcome package "
+            f"to help you get started. Inside, you’ll find direct links to your secure file portal, "
+            f"document checklist, and {TAX_YEAR} tax questionnaire, along with your Tax Services "
+            f"Engagement Agreement for review and signature.\n\n"
+            f"If you have any questions, please reach out to our office."
+        )
+    else:
+        # Standard fallback for single manual preview dispatches
+        adobe_email_subject = f"Tarrant Advisors {TAX_YEAR} Tax Services Engagement Agreement"
+        adobe_email_message = f"Please review and sign the attached Tarrant Advisors {TAX_YEAR} Tax Services Engagement Agreement."
+
+    adobe_agreement_id = ""
+    if is_paper_mode:
+        adobe_sign_routing_success, adobe_error_context = True, ""
+    else:
+        adobe_sign_routing_success, adobe_error_context = submit_adobe_sign_transaction(
+            client_qbo_id=client_qbo_id,
+            engagement_id=eng_id,
+            estimate_id=estimate_id,
+            pdf_binary_data=live_pdf_buffer.read(),
+            co_signer_email=co_signer_email,
+            is_organization=is_org_type,
+            primary_email_override=effective_primary_email,
+            primary_name_override=friendly_name,
+            co_signer_name=co_signer_name,
+            custom_message=adobe_email_message,
+            custom_subject=adobe_email_subject
+        )
+        if adobe_sign_routing_success:
+            adobe_agreement_id = adobe_error_context
+
+    if not adobe_sign_routing_success:
+        try:
+            qbo_api_request("estimate?operation=delete", method="POST", payload={"Id": estimate_id, "SyncToken": sync_token})
+            unlock_draft(draft_path)
+        except Exception as rollback_err:
+            print(f"CRITICAL ERROR: Rollback failed for Estimate {estimate_id}: {str(rollback_err)}", file=sys.stderr)
+        return render_pipeline_error(form, f"Adobe Sign Routing Error: Contract delivery failed. QuickBooks transaction backed out. Details: {adobe_error_context}")
+
+    try:
+        if os.path.exists(draft_path):
+            unlock_draft(draft_path)
+            with open(draft_path, "r", encoding="utf-8") as df:
+                active_draft = json.load(df)
+
+            # Mutate tracking fields while leaving everything else 100% untouched
+            active_draft["engagement_id"] = eng_id
+            active_draft["engagement_title"] = eng_title
+            active_draft["estimate_id"] = estimate_id
+            active_draft["phone"] = effective_phone
+            active_draft["delivery_format"] = target_qbo_format
+            if include_welcome_letter:
+                active_draft["questionnaire_status"] = "delivered"
+            if adobe_agreement_id:
+                active_draft["adobe_agreement_id"] = adobe_agreement_id
+
+            if "primary_signer" not in active_draft or not isinstance(active_draft["primary_signer"], dict):
+                active_draft["primary_signer"] = {}
+            active_draft["primary_signer"]["email"] = effective_primary_email
+
+            with open(draft_path, "w", encoding="utf-8") as df:
+                json.dump(active_draft, df, indent=2)
+            lock_draft(draft_path)
+    except Exception as de:
+        print(f"DEBUG: Post-transaction draft update failed: {str(de)}", file=sys.stderr)
+
+    if is_ajax_request(form):
+        print("Content-Type: application/json\n")
+        print(json.dumps({
+            "status": "success",
+            "estimate_id": estimate_id,
+            "qbo_id": client_qbo_id,
+            "engagement_id": eng_id,
+            "delivery_method": delivery_method,
+            "adobe_agreement_id": adobe_agreement_id
+        }))
+        return
+
+    dl_query_args = [
+        ("action", "download_final_pdf"),
+        ("client_name", raw_client_val),
+        ("engagement_id", eng_id)
+    ]
+
+    paper_dl_link = f"{SCRIPT_URL}?{urllib.parse.urlencode(dl_query_args)}"
+
+    has_co_signer = bool(co_signer_email and "@" in co_signer_email)
+    co_signer_label = co_signer_name.strip() if co_signer_name.strip() else co_signer_email.strip()
+
+    # Parallel Dispatch Workflow Status Box
+    signer_sequence_html = """
+    <div style="font-weight: 600; font-size: 13px; color: #475569; margin-top: 15px; margin-bottom: 8px;">Signature Request Status (Parallel Delivery):</div>
+    <div style="font-family: monospace; font-size: 13px; line-height: 1.6; color: #333155; background: #ffffff; padding: 12px; border-radius: 4px; border: 1px solid #e2e8f0;">
+    """
+
+    if is_org_type:
+        signer_sequence_html += f"""
+        <div style="margin-bottom: 8px;">
+            <strong>• Firm Counter-Signature</strong><br>
+            &nbsp;&nbsp;&nbsp;&nbsp;• Recipient: {html.escape(OWNER_SIGNATURE)} ({html.escape(OWNER_EMAIL)})<br>
+            &nbsp;&nbsp;&nbsp;&nbsp;• Status: <span style="color: #0284c7; font-weight: 600;">📩 Email Dispatched</span>
+        </div>
+        """
+
+    signer_sequence_html += f"""
+    <div style="margin-bottom: 8px;">
+        <strong>• Primary Client Signature</strong><br>
+        &nbsp;&nbsp;&nbsp;&nbsp;• Recipient: {html.escape(friendly_name)} ({html.escape(effective_primary_email)})<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;• Status: <span style="color: #0284c7; font-weight: 600;">📩 Email Dispatched</span>
+    </div>
+    """
+
+    if has_co_signer:
+        signer_sequence_html += f"""
+        <div>
+            <strong>• Additional Signer Signature</strong><br>
+            &nbsp;&nbsp;&nbsp;&nbsp;• Recipient: {html.escape(co_signer_label)} ({html.escape(co_signer_email)})<br>
+            &nbsp;&nbsp;&nbsp;&nbsp;• Status: <span style="color: #0284c7; font-weight: 600;">📩 Email Dispatched</span>
+        </div>
+        """
+
+    signer_sequence_html += "</div>"
+
+    if is_paper_mode:
+        delivery_card_html = f"""
+        <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 6px; padding: 20px; text-align: left; margin-bottom: 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+            <div style="font-weight: 700; font-size: 16px; color: #166534; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+                Physical Paper Delivery Prepared
+            </div>
+            <p style="margin: 0 0 15px 0; font-size: 13px; color: #475569; line-height: 1.5;">
+                This engagement agreement has been flagged for wet/paper signature execution. Download the official PDF document below to print or archive for client delivery.
+            </p>
+            <div style="text-align: center; margin-top: 15px;">
+                <a href="{html.escape(paper_dl_link)}" style="background: #16a34a; color: white; padding: 12px 24px; text-decoration: none; display: inline-block; border-radius: 4px; font-weight: bold; font-size: 15px;">⬇ Download & Print Final PDF</a>
+            </div>
+        </div>
+        """
+    else:
+        delivery_card_html = f"""
+        <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 6px; padding: 20px; text-align: left; margin-bottom: 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+            <div style="font-weight: 700; font-size: 16px; color: #0078d4; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+                Adobe Sign Document Dispatched
+            </div>
+            <div style="font-size: 13px; color: #334155; line-height: 1.6; margin-bottom: 10px;">
+                • <strong>Transaction ID:</strong> <span style="font-family: monospace; background: #f1f5f9; padding: 2px 6px; border-radius: 3px;">{html.escape(adobe_agreement_id if adobe_agreement_id else 'Enqueued')}</span><br>
+                • <strong>Status:</strong> <span style="color: #0284c7; font-weight: 600;">Out for Signature</span>
+            </div>
+            {signer_sequence_html}
+        </div>
+        """
+
+    formatted_fee_sum = f"${total_fee_sum:,}"
+
+    success_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Pipeline Execution Complete</title>
+    <link rel="stylesheet" type="text/css" href="/css/{get_asset_url(CSS_FILE)}">
+</head>
+<body>
+<div class="success-wrapper">
+    <div class="success-card">
+        <h2 style="margin-top: 0; margin-bottom: 8px; color: #0078d4; font-size: 22px;">{html.escape(legal_name)}</h2>
+        <div style="font-size: 15px; color: #334155; font-weight: 600; margin-bottom: 4px;">{html.escape(eng_title)}</div>
+        <div style="font-size: 13px; color: #16a34a; font-weight: 600; margin-bottom: 25px;">Status: Dispatched Successfully</div>
+
+        <!-- CARD 1: QUICKBOOKS ONLINE ESTIMATE -->
+        <div style="background: #ffffff; border: 1px solid #cbd5e0; border-radius: 6px; padding: 20px; text-align: left; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+            <div style="font-weight: 700; font-size: 16px; color: #166534; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+                QuickBooks Online Estimate
+            </div>
+            <div style="font-size: 13px; color: #334155; line-height: 1.6;">
+                • <strong>Estimate ID:</strong> #{html.escape(estimate_id)}<br>
+                • <strong>Total Amount:</strong> {formatted_fee_sum}<br>
+                • <strong>Status:</strong> Pending Approval
+            </div>
+        </div>
+
+        <!-- CARD 2: ADOBE SIGN WORKFLOW OR PAPER DOWNLOAD -->
+        {delivery_card_html}
+
+        <a href="{SCRIPT_URL}?action=view_workspace" class="btn-submit" style="background:#0078d4; text-decoration:none; display:inline-block; padding: 12px 24px; font-weight: 600;">← Return to Engagement Portal</a>
+    </div>
+</div>
+</body>
+</html>"""
+
+    print("Content-Type: text/html\n")
+    print(success_html)
+
+if __name__ == "__main__":
+    form_data = get_form_data()
+    action = get_form_val(form_data, "action")
+
+    if action == "generate_preview":
+        handle_generate_preview(form_data)
+    elif action == "print_paper_packets":
+        handle_print_paper_packets(form_data)
+    elif action == "save_draft_only":
+        handle_save_draft_only(form_data)
+    elif action == "patch_draft_only":
+        handle_patch_draft_only(form_data)
+    elif action == "delete_draft":
+        handle_delete_draft(form_data)
+    elif action == "render_live_pdf":
+        handle_render_live_pdf(form_data)
+    elif action == "download_draft_pdf":
+        handle_download_pdf(form_data, prefix="DRAFT")
+    elif action == "download_final_pdf":
+        handle_download_pdf(form_data, prefix="FINAL")
+    elif action == "view_signed_pdf":
+        handle_view_signed_pdf(form_data)
+    elif action == "send_resend_email":
+        handle_send_resend_email(form_data)
+    elif action == "email_welcome_letter_only":
+        handle_email_welcome_letter_only(form_data)
+    elif action == "send_adobe_reminder":
+        handle_send_adobe_reminder(form_data)
+    elif action == "execute_transactional_pipeline_paper":
+        form_data["delivery_method"] = "paper"
+        execute_transactional_pipeline(form_data)
+    elif action == "execute_transactional_pipeline":
+        form_data["delivery_method"] = ""
+        execute_transactional_pipeline(form_data)
+    elif action == "view_workspace":
+        render_phase1_workspace(preserved_form=form_data)
+    elif action == "revert_to_workspace":
+        raw_client_val = get_form_val(form_data, "client_name")
+        eng_id = get_form_val(form_data, "engagement_id", "0")
+        if raw_client_val and eng_id != "0":
+            try:
+                c_id = extract_qbo_id(raw_client_val)
+                unlock_draft(get_draft_file_path(c_id, eng_id))
+            except Exception as ex:
+                print(f"DEBUG: Could not unlock draft on revert: {str(ex)}", file=sys.stderr)
+        render_phase1_workspace(preserved_form=form_data)
+    else:
+        render_phase1_workspace()

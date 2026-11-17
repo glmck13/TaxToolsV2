@@ -1,0 +1,1989 @@
+// ==========================================
+// GLOBAL STATE & INITIALIZATION
+// ==========================================
+
+let batchCurrentPage = 1;
+let batchPageSize = 10;
+const globalBatchSelections = {}; // Stores `${qboId}:${engId}` -> boolean
+
+let currentSortColumn = null;
+let currentSortAscending = true;
+
+document.addEventListener("DOMContentLoaded", function() {
+    const isBatchEnabled = Boolean(window.APP_CONFIG && window.APP_CONFIG.enableBatchMode === true);
+    const modeTabsContainer = document.querySelector('.mode-tabs');
+
+    if (!isBatchEnabled) {
+        if (modeTabsContainer) {
+            modeTabsContainer.classList.add('mode-tabs-hidden');
+            modeTabsContainer.style.display = 'none';
+        }
+        switchWorkspaceMode('single');
+    }
+
+    // Initialize hidden engagement ID sync
+    updateEngagementIdFromSelection();
+});
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+/**
+ * Common utility function to evaluate whether engagement data or client profile is incomplete.
+ * @param {Object} clientObj - Main client object from window.clientData
+ * @param {Object} draft - Specific engagement draft object
+ * @returns {boolean} True if data is incomplete; false otherwise.
+ */
+function isProfileIncomplete(clientObj, draft) {
+    if (!clientObj) return true;
+
+    const meta = clientObj.metadata || {};
+    const addrObj = draft?.billing_address || clientObj.address || {};
+    const pSigner = draft?.primary_signer || {};
+
+    const isAddressMissing = !addrObj.street || !addrObj.city;
+    const isConfigMissing = !draft?.entity_type && !meta.entity_type;
+    const isEmailMissing = !pSigner.email && !draft?.primary_signer_email && !clientObj.email;
+
+    return isAddressMissing || isConfigMissing || isEmailMissing;
+}
+
+// ==========================================
+// WORKSPACE TAB & INTERACTION HELPERS
+// ==========================================
+
+function parseAdobeCompletion(rawVal) {
+    if (!rawVal) return { isSigned: false, isCancelled: false, date: '' };
+
+    const str = String(rawVal).trim();
+    return {
+        isSigned: str.startsWith('+'),
+        isCancelled: str.startsWith('!'),
+        date: str.slice(1)
+    };
+}
+
+function updateEngagementIdFromSelection() {
+    const inputEl = document.getElementById('client-select-input');
+    const hiddenEngInput = document.getElementById('engagement-id-input');
+    const datalist = document.getElementById('client-select-options');
+
+    if (!inputEl || !hiddenEngInput) return;
+
+    const val = inputEl.value.trim();
+    if (!val) {
+        hiddenEngInput.value = "0";
+        return;
+    }
+
+    let matchedEngId = null;
+
+    // 1. Try matching against datalist <option> data-value="QBO_ID:ENG_ID"
+    if (datalist && datalist.options) {
+        for (let opt of datalist.options) {
+            if (opt.value === val) {
+                const dataVal = opt.getAttribute('data-value'); // Format: "58:1"
+                if (dataVal && dataVal.includes(':')) {
+                    matchedEngId = dataVal.split(':')[1];
+                }
+                break;
+            }
+        }
+    }
+
+    // 2. Fallback: Parse directly from string format like "[D] Client Name: 58 | 1: Title"
+    if (!matchedEngId && val.includes('|')) {
+        const pipeParts = val.split('|');
+        if (pipeParts.length > 1) {
+            const engPart = pipeParts[1].trim(); // "1: Title"
+            const match = engPart.match(/^(\d+):/);
+            if (match) {
+                matchedEngId = match[1];
+            }
+        }
+    }
+
+    hiddenEngInput.value = matchedEngId ? matchedEngId : "0";
+}
+
+function switchWorkspaceMode(mode) {
+    const singleTab = document.getElementById('tab-btn-single');
+    const batchTab = document.getElementById('tab-btn-batch');
+    const singleWorkspace = document.getElementById('single-client-workspace');
+    const batchWorkspace = document.getElementById('batch-dashboard-workspace');
+
+    if (mode === 'single') {
+        if (singleTab) singleTab.classList.add('active');
+        if (batchTab) batchTab.classList.remove('active');
+        if (singleWorkspace) singleWorkspace.style.display = 'block';
+        if (batchWorkspace) batchWorkspace.style.display = 'none';
+    } else if (mode === 'batch') {
+        if (batchTab) batchTab.classList.add('active');
+        if (singleTab) singleTab.classList.remove('active');
+        if (batchWorkspace) batchWorkspace.style.display = 'block';
+        if (singleWorkspace) singleWorkspace.style.display = 'none';
+
+        if (typeof renderBatchTableGrid === 'function') {
+            renderBatchTableGrid();
+        }
+    }
+}
+
+function openSingleWorkspaceForClient(qboId, engId) {
+    // 1. Switch active view to single client intake
+    switchWorkspaceMode('single');
+
+    // 2. Target client intake dropdown inputs
+    const hiddenInput = document.getElementById('client-select');
+    const visibleInput = document.getElementById('client-select-input');
+    const hiddenEngInput = document.getElementById('engagement-id-input');
+    const datalist = document.getElementById('client-select-options');
+
+    if (!hiddenInput || !visibleInput) return;
+
+    // 3. Resolve customer entry key from datalist or clientData store
+    let matchedOptionValue = '';
+    const targetKey = `${qboId}:${engId}`;
+
+    if (datalist) {
+        const options = datalist.querySelectorAll('option');
+        for (const opt of options) {
+            const dataVal = opt.getAttribute('data-value');
+            if (dataVal === targetKey) {
+                matchedOptionValue = opt.value;
+                break;
+            }
+        }
+        // Fallback to customer default draft if exact engagement ID match was not found
+        if (!matchedOptionValue) {
+            for (const opt of options) {
+                const dataVal = opt.getAttribute('data-value');
+                if (dataVal?.startsWith(`${qboId}:`)) {
+                    matchedOptionValue = opt.value;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!matchedOptionValue && window.clientData) {
+        for (const k in window.clientData) {
+            if (String(window.clientData[k].id) === String(qboId)) {
+                matchedOptionValue = k;
+                break;
+            }
+        }
+    }
+
+    if (matchedOptionValue) {
+        visibleInput.value = matchedOptionValue;
+        hiddenInput.value = matchedOptionValue;
+    } else {
+        visibleInput.value = `${qboId}:${engId}`;
+        hiddenInput.value = `${qboId}:${engId}`;
+    }
+
+    if (hiddenEngInput) {
+        hiddenEngInput.value = String(engId || "0");
+    }
+
+    // 4. Trigger client change handler to load complete engagement view
+    onClientChange();
+
+    // 5. Smooth scroll to workspace top
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function toggleEmailComposer() {
+    const fields = document.getElementById('email-composer-fields');
+    if (fields) {
+        fields.style.display = (fields.style.display === 'none' || !fields.style.display) ? 'block' : 'none';
+    }
+}
+
+function toggleInlineCopyBar(show) {
+    const bar = document.getElementById('inline-copy-toolbar');
+    if (bar) {
+        bar.style.display = show ? 'block' : 'none';
+    }
+}
+
+// ==========================================
+// REVIEW & APPROVAL UI HELPERS (OPTION B)
+// ==========================================
+
+function getStoredReviewerInitials() {
+    return (localStorage.getItem('reviewer_initials') || '').toUpperCase();
+}
+
+function setStoredReviewerInitials(initials) {
+    if (initials) {
+        localStorage.setItem('reviewer_initials', initials.toUpperCase());
+    }
+}
+
+function renderApprovalCardHtml(draft) {
+    const isApproved = Boolean(draft && draft.is_approved === true);
+    const savedInitials = draft?.reviewed_by || getStoredReviewerInitials();
+    const approvedAt = draft?.reviewed_at || '';
+
+    const cardClass = isApproved ? 'approval-card-approved' : 'approval-card-unapproved';
+    const checkedAttr = isApproved ? 'checked' : '';
+    const dateDisplay = approvedAt ? ` on ${approvedAt}` : '';
+
+    return `
+        <div id="approval-card-container" class="approval-card ${cardClass}">
+            <div class="approval-flex-container">
+                <label class="approval-checkbox-label">
+                    <input type="checkbox" id="is_approved_checkbox" name="is_approved" value="true" ${checkedAttr} onchange="onApprovalToggleChange(this.checked)">
+                    <span>Engagement Reviewed & Approved for Dispatch</span>
+                </label>
+                <div class="approval-inputs-group">
+                    <div class="reviewer-initials-group">
+                        <label for="reviewed_by_input">Reviewer Initials:</label>
+                        <input type="text" 
+                               id="reviewed_by_input" 
+                               name="reviewed_by" 
+                               class="reviewer-initials-input" 
+                               value="${escapeHtml(savedInitials)}" 
+                               maxlength="3" 
+                               oninput="this.value = this.value.toUpperCase().replace(/[^A-Z-]/g, ''); setStoredReviewerInitials(this.value);">
+                    </div>
+                    <span id="approval-meta-text" class="approval-meta-text">${isApproved ? `Approved by ${escapeHtml(savedInitials)}${dateDisplay}` : 'Awaiting manual sign-off'}</span>
+                </div>
+            </div>
+            <input type="hidden" id="reviewed_at_input" name="reviewed_at" value="${escapeHtml(approvedAt)}">
+        </div>
+    `;
+}
+
+function onApprovalToggleChange(isChecked) {
+    const card = document.getElementById('approval-card-container');
+    const initialsInput = document.getElementById('reviewed_by_input');
+    const metaText = document.getElementById('approval-meta-text');
+    const timestampInput = document.getElementById('reviewed_at_input');
+
+    if (isChecked) {
+        if (card) {
+            card.classList.remove('approval-card-unapproved');
+            card.classList.add('approval-card-approved');
+        }
+
+        let savedInitials = getStoredReviewerInitials();
+        let typedInitials = initialsInput ? initialsInput.value.trim().toUpperCase() : '';
+        let currentInitials = typedInitials || savedInitials || '';
+
+        if (initialsInput) {
+            initialsInput.value = currentInitials;
+        }
+        if (currentInitials) {
+            setStoredReviewerInitials(currentInitials);
+        }
+
+        const nowStr = new Date().toLocaleString('en-US', { month: 'short', day: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+        if (timestampInput) timestampInput.value = nowStr;
+        if (metaText) metaText.innerText = `Approved by ${currentInitials} on ${nowStr}`;
+    } else {
+        if (card) {
+            card.classList.remove('approval-card-approved');
+            card.classList.add('approval-card-unapproved');
+        }
+        if (timestampInput) timestampInput.value = '';
+        if (metaText) metaText.innerText = 'Awaiting manual sign-off';
+    }
+}
+
+// ==========================================
+// CLIENT METADATA PROFILE RENDERER
+// ==========================================
+
+function renderProfileCard(clientObj, draft, selectedEngId) {
+    const container = document.getElementById('profile-healing-container');
+    if (!container) return;
+
+    const meta = clientObj.metadata || {};
+    const addr = draft?.billing_address || clientObj.address || {};
+    const pSigner = draft?.primary_signer || {};
+    const coSigner = draft?.co_signer || {};
+
+    const friendlyName = pSigner.friendly_name || draft?.friendly_name || meta.friendly_name || '';
+    const legalName = pSigner.legal_name || draft?.legal_name || meta.legal_name || meta.friendly_name || '';
+    const primaryEmail = pSigner.email || draft?.primary_signer_email || meta.primary_signer_email || clientObj.email || '';
+    const phone = draft?.phone || meta.phone || clientObj.phone || '';
+
+    const street = addr.street || addr.Line1 || '';
+    const city = addr.city || addr.City || '';
+    const state = addr.state || addr.CountrySubDivisionCode || '';
+    const zip = addr.zip || addr.PostalCode || '';
+
+    const entityType = draft?.entity_type || meta.entity_type || 'individual';
+    const deliveryFormat = draft?.delivery_format || meta.delivery_format || 'electronic';
+    const coSignerName = coSigner.name || draft?.co_signer_name || meta.co_signer_name || '';
+    const coSignerEmail = coSigner.email || draft?.co_signer_email || meta.co_signer_email || '';
+    const engTitle = draft?.engagement_title || '2026 Tax Services Agreement';
+
+    const isIncomplete = isProfileIncomplete(clientObj, draft);
+    const cardClass = isIncomplete ? 'profile-card-incomplete' : 'profile-card-complete';
+    const warningBadge = isIncomplete ? ' <span class="badge badge-warning">⚠️ Data Incomplete</span>' : '';
+
+    container.innerHTML = `
+        <div class="profile-card ${cardClass}">
+            <input type="hidden" id="delivery_format" name="delivery_format" value="${escapeHtml(deliveryFormat)}">
+            <div class="profile-card-title">Client Account & Signer Profile Metadata${warningBadge}</div>
+
+            <div class="profile-editable-grid-top">
+                <div class="form-field-group engagement-title-group">
+                    <label class="field-label">Engagement Document Title:</label>
+                    <input type="text" id="engagement_title" name="engagement_title" value="${escapeHtml(engTitle)}">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">Primary Signer Friendly Name:</label>
+                    <input type="text" id="friendly_name" name="friendly_name" value="${escapeHtml(friendlyName)}">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">Legal Name / Entity Title:</label>
+                    <input type="text" id="legal_name" name="legal_name" value="${escapeHtml(legalName)}">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">Primary Signer Email:</label>
+                    <input type="email" id="primary_signer_email" name="primary_signer_email" value="${escapeHtml(primaryEmail)}">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">Primary Phone Number:</label>
+                    <input type="tel" id="phone" name="phone" value="${escapeHtml(phone)}">
+                </div>
+            </div>
+
+            <div class="profile-editable-grid-middle">
+                <div class="form-field-group">
+                    <label class="field-label">Street Address:</label>
+                    <input type="text" id="street" name="street" value="${escapeHtml(street)}">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">City:</label>
+                    <input type="text" id="city" name="city" value="${escapeHtml(city)}">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">State:</label>
+                    <input type="text" id="state" name="state" value="${escapeHtml(state)}" maxlength="2">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">Zip Code:</label>
+                    <input type="text" id="zip" name="zip" value="${escapeHtml(zip)}">
+                </div>
+            </div>
+
+            <div class="profile-editable-grid-bottom">
+                <div class="form-field-group">
+                    <label class="field-label">Account Classification / Entity Type:</label>
+                    <select id="entity_type" name="entity_type">
+                        <option value="individual" ${entityType === 'individual' ? 'selected' : ''}>Individual Taxpayer (1040)</option>
+                        <option value="s_corp" ${entityType === 's_corp' ? 'selected' : ''}>S-Corporation (1120-S)</option>
+                        <option value="partnership" ${entityType === 'partnership' ? 'selected' : ''}>Partnership (1065)</option>
+                        <option value="c_corp" ${entityType === 'c_corp' ? 'selected' : ''}>C-Corporation (1120)</option>
+                        <option value="non_profit" ${entityType === 'non_profit' ? 'selected' : ''}>Non-Profit / Tax-Exempt (990)</option>
+                        <option value="trust" ${entityType === 'trust' ? 'selected' : ''}>Trust / Estate Fiduciary (1041)</option>
+                        <option value="organization" ${entityType === 'organization' ? 'selected' : ''}>Business Entity / Organization</option>
+                    </select>
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">Co-Signer Full Name (Joint Return):</label>
+                    <input type="text" id="co_signer_name" name="co_signer_name" value="${escapeHtml(coSignerName)}">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label">Co-Signer Email Address:</label>
+                    <input type="email" id="co_signer_email" name="co_signer_email" value="${escapeHtml(coSignerEmail)}">
+                </div>
+            </div>
+        </div>
+    `;
+
+    container.style.display = 'block';
+}
+
+// ==========================================
+// OUT-OF-SCOPE CHECKLIST STATE SYNCHRONIZER
+// ==========================================
+
+function syncOutOfScopeChecklistFromDraft(draft) {
+    const container = document.getElementById('out-of-scope-checklist-container');
+    if (!container) return;
+
+    const oosData = draft?.out_of_scope_items || null;
+
+    // 1. Uncheck all boilerplate inputs first
+    const inputs = container.querySelectorAll('input[type="checkbox"]');
+    inputs.forEach(cb => {
+        if (!cb.name.includes('custom')) {
+            cb.checked = false;
+        }
+    });
+
+    // 2. Remove existing custom item DOM rows
+    const customRows = container.querySelectorAll('.custom-out-of-scope-item');
+    customRows.forEach(el => el.remove());
+
+    // 3. If draft has stored items, check matched boilerplate items & rebuild custom items
+    if (oosData && typeof oosData === 'object') {
+        Object.entries(oosData).forEach(([key, val]) => {
+            if (key.includes('custom')) {
+                // Rebuild custom item row
+                const div = document.createElement('div');
+                div.className = 'out-of-scope-checklist-item custom-out-of-scope-item';
+                div.style.cssText = 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px dashed #e2e8f0;';
+                div.innerHTML = `
+                    <label style="font-weight: normal; display: flex; align-items: center; gap: 8px; cursor: pointer; flex-grow: 1;">
+                        <input type="checkbox" name="${escapeHtml(key)}" value="${escapeHtml(val)}" checked>
+                        <span>${escapeHtml(val)}</span>
+                    </label>
+                    <button type="button" class="btn-remove-row" onclick="this.parentElement.remove()" title="Remove Custom Exclusion" style="margin-left: 10px;">×</button>
+                `;
+                container.appendChild(div);
+            } else {
+                // Check matching boilerplate checkbox
+                const targetCb = container.querySelector(`input[name="${key}"]`);
+                if (targetCb) {
+                    targetCb.checked = true;
+                }
+            }
+        });
+    } else {
+        // Brand new engagement draft: default all boilerplate checkboxes to checked
+        inputs.forEach(cb => {
+            if (!cb.name.includes('custom')) {
+                cb.checked = true;
+            }
+        });
+    }
+}
+
+// ==========================================
+// SEGMENTED PILL CONTROL (WELCOME LETTER TOGGLE)
+// ==========================================
+
+function setSegmentedWelcomeLetter(enable) {
+    const btnStd = document.getElementById('seg-btn-std');
+    const btnWelcome = document.getElementById('seg-btn-welcome');
+    const hiddenInput = document.getElementById('include-cover-letter-input');
+
+    if (enable) {
+        if (btnWelcome) btnWelcome.classList.add('active');
+        if (btnStd) btnStd.classList.remove('active');
+        if (hiddenInput) hiddenInput.value = 'true';
+    } else {
+        if (btnStd) btnStd.classList.add('active');
+        if (btnWelcome) btnWelcome.classList.remove('active');
+        if (hiddenInput) hiddenInput.value = 'false';
+    }
+}
+
+function renderSegmentedPillControl() {
+    return `
+        <div class="segmented-control-container">
+            <button type="button" id="seg-btn-std" class="segmented-btn active" onclick="setSegmentedWelcomeLetter(false)">Standard</button>
+            <button type="button" id="seg-btn-welcome" class="segmented-btn" onclick="setSegmentedWelcomeLetter(true)">+ Welcome Letter</button>
+            <input type="hidden" name="include_cover_letter" id="include-cover-letter-input" value="false">
+        </div>
+    `;
+}
+
+// ==========================================
+// SINGLE CLIENT INTAKE WORKSPACE
+// ==========================================
+
+function onClientInput() {
+    const input = document.getElementById('client-select-input');
+    const hiddenInput = document.getElementById('client-select');
+    if (!input || !hiddenInput) return;
+
+    hiddenInput.value = input.value;
+    updateEngagementIdFromSelection();
+    onClientChange();
+}
+
+function onClientChange() {
+    const input = document.getElementById('client-select-input');
+    if (!input || !input.value) return;
+
+    const val = input.value.trim();
+    let selectedQboId = '';
+    let selectedEngId = document.getElementById('engagement-id-input')?.value || '0';
+
+    // 1. Resolve IDs from datalist options if available
+    const datalist = document.getElementById('client-select-options');
+    if (datalist) {
+        const options = datalist.querySelectorAll('option');
+        for (const opt of options) {
+            if (opt.value === val) {
+                const dataVal = opt.getAttribute('data-value');
+                if (dataVal && dataVal.includes(':')) {
+                    const parts = dataVal.split(':');
+                    selectedQboId = parts[0];
+                    selectedEngId = parts[1];
+                }
+                break;
+            }
+        }
+    }
+
+    // 2. Fallback: Parse string formatting directly
+    if (!selectedQboId) {
+        const idMatch = val.match(/:\s*(\d+)(?:\s*\||\s*$)/);
+        if (idMatch) selectedQboId = idMatch[1];
+
+        if (val.includes('|')) {
+            const engMatch = val.split('|')[1].match(/^(\d+):/);
+            if (engMatch) selectedEngId = engMatch[1];
+        }
+    }
+
+    // 3. Fallback: Direct key or ID lookup against clientData
+    if (!selectedQboId && window.clientData) {
+        for (const k in window.clientData) {
+            if (k === val || String(window.clientData[k].id) === val) {
+                selectedQboId = String(window.clientData[k].id);
+                break;
+            }
+        }
+    }
+
+    if (!selectedQboId) return;
+
+    // Sync hidden engagement ID input
+    const hiddenEngInput = document.getElementById('engagement-id-input');
+    if (hiddenEngInput) hiddenEngInput.value = selectedEngId;
+
+    // Load workspace client object
+    let clientObj = null;
+    for (const k in window.clientData) {
+        if (String(window.clientData[k].id) === String(selectedQboId)) {
+            clientObj = window.clientData[k];
+            break;
+        }
+    }
+
+    if (!clientObj) return;
+
+    // Unhide UI containers
+    const serviceTable = document.getElementById('service-table');
+    const actionsContainer = document.getElementById('actions-container');
+    const oosContainer = document.getElementById('out-of-scope-container');
+    const submitBtn = document.getElementById('btn-submit-main');
+    const submitContainer = submitBtn ? submitBtn.parentElement : null;
+    const syncToolbar = document.getElementById('qbo-sync-toolbar-container');
+    const approvalContainer = document.getElementById('single-approval-card-container');
+
+    if (serviceTable) serviceTable.style.display = 'table';
+    if (actionsContainer) actionsContainer.style.display = 'flex';
+    if (oosContainer) oosContainer.style.display = 'block';
+    if (syncToolbar) syncToolbar.style.display = 'block';
+
+    const tbody = document.getElementById('service-tbody');
+    if (tbody) tbody.innerHTML = '';
+
+    let draft = null;
+    if (selectedEngId !== '0' && clientObj.engagements && clientObj.engagements[selectedEngId]) {
+        draft = clientObj.engagements[selectedEngId];
+    }
+
+    // Render client metadata profile
+    renderProfileCard(clientObj, draft, selectedEngId);
+
+    const effectiveFormat = draft?.delivery_format || clientObj?.metadata?.delivery_format || 'electronic';
+    const formatSelect = document.getElementById('delivery_format');
+    if (formatSelect) {
+        formatSelect.value = effectiveFormat;
+    }
+
+    if (approvalContainer) {
+        approvalContainer.style.display = 'block';
+        approvalContainer.innerHTML = renderApprovalCardHtml(draft);
+    }
+
+    // Lock Banner & Delete Draft Button Visibility Control
+    const lockBanner = document.getElementById('lock-banner-container');
+    const deleteBtn = document.getElementById('btn-delete-draft');
+    const isLocked = Boolean(draft && draft.is_locked);
+
+    if (lockBanner) {
+        if (isLocked) {
+            lockBanner.style.display = 'block';
+            lockBanner.innerHTML = `<div style="background:#fff3cd; border:1px solid #ffebaa; color:#856404; padding:12px; margin-bottom:15px; border-radius:4px;">🔒 <strong>Engagement #${selectedEngId} is locked.</strong> Sourced on ${draft.locked_mtime}.</div>`;
+        } else {
+            lockBanner.style.display = 'none';
+            lockBanner.innerHTML = '';
+        }
+    }
+
+    // Ensure Delete Draft button renders ONLY when engagement exists and is NOT locked
+    if (deleteBtn) {
+        deleteBtn.style.display = (draft && !isLocked) ? 'inline-block' : 'none';
+    }
+
+    // Handle form row persistence and rendering
+    if (Array.isArray(window.reconstructedRows) && window.reconstructedRows.length > 0) {
+        if (!clientObj.engagements) clientObj.engagements = {};
+        if (!clientObj.engagements[selectedEngId]) {
+            clientObj.engagements[selectedEngId] = { engagement_id: selectedEngId };
+        }
+        clientObj.engagements[selectedEngId].rows = JSON.parse(JSON.stringify(window.reconstructedRows));
+        window.reconstructedRows.forEach(r => addServiceRow(r.item_id, r.service, r.fee, r.notes, clientObj));
+        window.reconstructedRows = null;
+    } else if (draft && Array.isArray(draft.rows) && draft.rows.length > 0) {
+        draft.rows.forEach(r => addServiceRow(r.item_id, r.service, r.fee, r.notes, clientObj));
+    } else {
+        addServiceRow('', '', '', '', clientObj);
+    }
+
+    if (submitBtn) {
+        submitBtn.style.display = 'inline-block';
+        submitBtn.innerText = '⚡ Render PDF Preview';
+
+        if (submitContainer && !document.getElementById('seg-btn-std')) {
+            submitContainer.classList.add('submit-container-flex');
+            submitContainer.insertAdjacentHTML('afterbegin', renderSegmentedPillControl());
+        }
+    }
+
+    recalculateTotals();
+
+    // Sync out-of-scope checkboxes and custom items from the loaded draft state
+    syncOutOfScopeChecklistFromDraft(draft);
+
+    // Re-assert visibility after row setup and calculations complete
+    if (oosContainer) oosContainer.style.display = 'block';
+}
+
+function addServiceRow(itemId = '', service = '', fee = '', notes = '', explicitClientObj = null) {
+    // Detect if the Batch Edit Modal is currently visible
+    const batchModal = document.getElementById('batch-edit-modal');
+    const isModalOpen = batchModal && getComputedStyle(batchModal).display !== 'none';
+
+    // Route to the modal's table body if open, otherwise target the main workspace table body
+    const tbody = (isModalOpen && batchModal) 
+        ? batchModal.querySelector('#service-tbody') 
+        : document.getElementById('service-tbody');
+
+    if (!tbody) return;
+
+    const rowId = Date.now() + Math.floor(Math.random() * 1000);
+    const tr = document.createElement('tr');
+    tr.id = `service_row_${rowId}`;
+
+    let resolvedItemId = itemId;
+    let selectedOptionValue = service || '';
+    const defaultSelected = (!service && !resolvedItemId) ? 'selected' : '';
+    let optionsHtml = '<option value="" disabled ' + defaultSelected + '>-- Select Service Item --</option>';
+
+    // Use passed client object or resolve active client object safely
+    let activeClientObj = explicitClientObj;
+    if (!activeClientObj && window.clientData) {
+        let targetQboId = '';
+
+        if (isModalOpen) {
+            // Read the QBO ID directly from the modal container attribute set when opened
+            const container = document.getElementById('modal-workspace-container');
+            targetQboId = container?.getAttribute('data-qbo-id') || '';
+        } else {
+            // Fallback to the single-client input selector
+            const activeInputVal = document.getElementById('client-select-input')?.value || '';
+            const idMatch = activeInputVal.match(/:\s*(\d+)(?:\s*\||\s*$)/);
+            if (idMatch) targetQboId = idMatch[1];
+        }
+
+        for (const k in window.clientData) {
+            const client = window.clientData[k];
+            if (String(client.id) === String(targetQboId)) {
+                activeClientObj = client;
+                break;
+            }
+        }
+    }
+
+    const clientForServices = activeClientObj || (window.clientData ? Object.values(window.clientData)[0] : null);
+    if (clientForServices && Array.isArray(clientForServices.exposed_services)) {
+        clientForServices.exposed_services.forEach(s => {
+            let sel = '';
+            const cleanSvc = (service || '').trim().toLowerCase();
+
+            if (cleanSvc) {
+                // Prioritize explicit service name match
+                sel = (s.name.trim().toLowerCase() === cleanSvc) ? 'selected' : '';
+            } else if (itemId) {
+                // Fallback to item ID match only when no service name exists
+                sel = (String(s.id) === String(itemId)) ? 'selected' : '';
+            }
+
+            if (sel) {
+                resolvedItemId = s.id;
+                selectedOptionValue = s.name;
+            }
+            optionsHtml += `<option value="${escapeHtml(s.name)}" data-item-id="${s.id}" data-service-name="${escapeHtml(s.name)}" data-fee="${s.fee}" data-notes="${escapeHtml(s.notes)}" ${sel}>${escapeHtml(s.name)}</option>`;
+        });
+    }
+
+    tr.innerHTML = `
+        <td style="text-align: center; width: 40px; padding-top: 16px;">
+            <button type="button" class="btn-remove-row" onclick="removeServiceRow('${rowId}')" title="Remove Line">×</button>
+            <input type="hidden" name="selected_rows" value="${rowId}">
+            <input type="hidden" name="row_item_id_${rowId}" id="row_item_id_${rowId}" value="${escapeHtml(resolvedItemId)}">
+        </td>
+        <td>
+            <select name="row_service_${rowId}" id="row_service_${rowId}" style="width: 100%; padding: 8px;" required onchange="onServiceDropdownChange('${rowId}')">
+                ${optionsHtml}
+            </select>
+        </td>
+        <td style="white-space: nowrap; width: 140px;">
+            <span style="position: relative; font-family: monospace; font-size: 15px; top: 4px;">
+                $ <input type="number" name="row_fee_${rowId}" id="row_fee_${rowId}" step="1" min="-99999" value="${fee !== undefined && fee !== null ? fee : ''}" placeholder="0" oninput="recalculateTotals()" style="width: 90px; padding: 6px; margin-left: 6px;" required>
+            </span>
+        </td>
+        <td class="notes-cell">
+            <textarea name="row_notes_${rowId}" id="row_notes_${rowId}" placeholder="Enter custom line parameters or scope exclusions..." style="width: 100%; height: 46px; font-family: inherit; font-size: 13px; padding: 6px; box-sizing: border-box; resize: vertical;">${escapeHtml(notes)}</textarea>
+        </td>
+    `;
+
+    tbody.appendChild(tr);
+
+    // Enforce selection value on DOM node directly by matching option value (service name)
+    if (selectedOptionValue) {
+        const selectEl = tr.querySelector(`#row_service_${rowId}`);
+        if (selectEl) selectEl.value = selectedOptionValue;
+    }
+
+    recalculateTotals();
+}
+
+function removeServiceRow(rowId) {
+    const tr = document.getElementById(`service_row_${rowId}`);
+    if (tr) tr.remove();
+    recalculateTotals();
+}
+
+function onServiceDropdownChange(rowId) {
+    const select = document.getElementById(`row_service_${rowId}`);
+    const feeInput = document.getElementById(`row_fee_${rowId}`);
+    const notesInput = document.getElementById(`row_notes_${rowId}`);
+    const itemIdHidden = document.getElementById(`row_item_id_${rowId}`);
+
+    if (!select) return;
+
+    const opt = select.options[select.selectedIndex];
+    if (opt && opt.value) {
+        if (itemIdHidden) itemIdHidden.value = opt.getAttribute('data-item-id') || '';
+        if (feeInput) {
+            feeInput.value = opt.getAttribute('data-fee') || '0';
+        }
+        if (notesInput) {
+            notesInput.value = opt.getAttribute('data-notes') || '';
+        }
+    } else {
+        if (itemIdHidden) itemIdHidden.value = '';
+        if (feeInput) feeInput.value = '0';
+        if (notesInput) notesInput.value = '';
+    }
+    recalculateTotals();
+}
+
+function recalculateTotals() {
+    let baseTotal = 0;
+    let discountTotal = 0;
+
+    // Target the modal's tbody if the batch modal is open, otherwise fallback to the main workspace tbody
+    const batchModal = document.getElementById('batch-edit-modal');
+    const isModalOpen = batchModal && getComputedStyle(batchModal).display !== 'none';
+    const tbody = (isModalOpen && batchModal) ? batchModal.querySelector('#service-tbody') : document.getElementById('service-tbody');
+
+    if (!tbody) return;
+
+    const rows = tbody.querySelectorAll('tr');
+    rows.forEach(tr => {
+        const feeInput = tr.querySelector('input[type="number"]');
+        const select = tr.querySelector('select');
+        if (feeInput) {
+            const val = parseInt(feeInput.value, 10) || 0;
+
+            let serviceText = '';
+            if (select && select.selectedIndex >= 0) {
+                const opt = select.options[select.selectedIndex];
+                serviceText = (opt?.getAttribute('data-service-name') || opt?.value || opt?.text || '').toLowerCase();
+            }
+
+            if (serviceText.includes('discount') || serviceText.includes('referral')) {
+                discountTotal += Math.abs(val);
+            } else {
+                baseTotal += val;
+            }
+        }
+    });
+
+    const netTotal = baseTotal - discountTotal;
+
+    // Target the active container (modal vs main single-client view) for summary element updates
+    const activeContext = (isModalOpen && batchModal) ? batchModal : document;
+    const discountEl = activeContext.querySelector('#ui-total-discount');
+    const balanceEl = activeContext.querySelector('#ui-total-balance');
+
+    if (discountEl) discountEl.innerText = `-$${discountTotal.toLocaleString()}`;
+    if (balanceEl) balanceEl.innerText = `$${netTotal.toLocaleString()}`;
+}
+
+function addCustomOutOfScopeItem() {
+    const input = document.getElementById('new-out-of-scope-input');
+    const container = document.getElementById('out-of-scope-checklist-container');
+
+    if (!input || !container || !input.value.trim()) return;
+
+    const val = input.value.trim();
+    const itemKey = `custom_out_of_scope_${Date.now()}`;
+
+    const div = document.createElement('div');
+    div.className = 'out-of-scope-checklist-item custom-out-of-scope-item';
+    div.style.cssText = 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px dashed #e2e8f0;';
+    div.innerHTML = `
+        <label style="font-weight: normal; display: flex; align-items: center; gap: 8px; cursor: pointer; flex-grow: 1;">
+            <input type="checkbox" name="${itemKey}" value="${escapeHtml(val)}" checked>
+            <span>${escapeHtml(val)}</span>
+        </label>
+        <button type="button" class="btn-remove-row" onclick="this.parentElement.remove()" title="Remove Custom Exclusion" style="margin-left: 10px;">×</button>
+    `;
+
+    container.appendChild(div);
+    input.value = '';
+}
+
+function applyClonedScopeFromSource() {
+    const sourceInput = document.getElementById('clone-source-input');
+    if (!sourceInput || !sourceInput.value) return alert('Select a source engagement to copy scope from.');
+
+    const sourceVal = sourceInput.value.trim();
+    const parts = sourceVal.split(':');
+    if (parts.length < 2) return alert('Invalid source selection format.');
+
+    const qboId = parts[0];
+    const engId = parts[1];
+
+    let sourceDraft = null;
+    for (const k in window.clientData) {
+        if (String(window.clientData[k].id) === String(qboId)) {
+            sourceDraft = window.clientData[k].engagements?.[engId];
+            break;
+        }
+    }
+
+    if (!sourceDraft || !sourceDraft.rows) return alert('Could not locate scope rows in source engagement.');
+
+    const tbody = document.getElementById('service-tbody');
+    if (tbody) tbody.innerHTML = '';
+
+    sourceDraft.rows.forEach(r => addServiceRow(r.item_id, r.service, r.fee, r.notes));
+
+    // Also copy out-of-scope checklist selections if present
+    syncOutOfScopeChecklistFromDraft(sourceDraft);
+
+    toggleInlineCopyBar(false);
+}
+
+// ==========================================
+// BATCH DASHBOARD WORKSPACE (PAGINATED MODEL)
+// ==========================================
+
+function setBatchPageSize(size) {
+    batchPageSize = (size === 'all') ? 'all' : parseInt(size, 10);
+    batchCurrentPage = 1;
+
+    document.querySelectorAll('.page-size-selector').forEach(sel => {
+        sel.value = size;
+    });
+
+    renderBatchTableGrid();
+}
+
+function changeBatchPage(direction) {
+    const filteredRows = getFilteredBatchRows();
+    if (batchPageSize === 'all') return;
+
+    const totalPages = Math.max(1, Math.ceil(filteredRows.length / batchPageSize));
+
+    if (direction === 'first') batchCurrentPage = 1;
+    else if (direction === 'prev' && batchCurrentPage > 1) batchCurrentPage--;
+    else if (direction === 'next' && batchCurrentPage < totalPages) batchCurrentPage++;
+    else if (direction === 'last') batchCurrentPage = totalPages;
+
+    renderBatchTableGrid();
+}
+
+function handleBatchCheckboxToggle(qboId, engId, isChecked) {
+    const key = `${qboId}:${engId}`;
+    globalBatchSelections[key] = isChecked;
+
+    // Update master header checkbox state & apply button counter dynamically
+    const filteredRows = getFilteredBatchRows();
+    const activeMasterCheckbox = document.getElementById('master-batch-checkbox');
+
+    if (activeMasterCheckbox && filteredRows.length > 0) {
+        const selectedCount = filteredRows.filter(r => globalBatchSelections[`${r.qboId}:${r.engId}`] === true).length;
+        if (selectedCount === 0) {
+            activeMasterCheckbox.checked = false;
+            activeMasterCheckbox.indeterminate = false;
+        } else if (selectedCount === filteredRows.length) {
+            activeMasterCheckbox.checked = true;
+            activeMasterCheckbox.indeterminate = false;
+        } else {
+            activeMasterCheckbox.checked = false;
+            activeMasterCheckbox.indeterminate = true;
+        }
+    }
+
+    updateBatchSummaryMetrics();
+}
+
+function sortBatchTable(columnIndex) {
+    if (currentSortColumn === columnIndex) {
+        currentSortAscending = !currentSortAscending;
+    } else {
+        currentSortColumn = columnIndex;
+        currentSortAscending = true;
+    }
+    renderBatchTableGrid();
+}
+
+function getFilteredBatchRows() {
+    if (!window.clientData) return [];
+
+    const searchQuery = (document.getElementById('batch-search-input')?.value || '').toLowerCase();
+    const formatFilter = document.getElementById('batch-format-filter')?.value || 'all';
+    const allRecords = [];
+
+    Object.keys(window.clientData).forEach(clientKey => {
+        const client = window.clientData[clientKey];
+        const qboId = String(client.id);
+        const meta = client.metadata || {};
+        const engagements = client.engagements || {};
+
+        Object.keys(engagements).forEach(engId => {
+            const draft = engagements[engId];
+            const isLocked = Boolean(draft.is_locked);
+            const effectiveFormat = draft.delivery_format || meta.delivery_format || 'electronic';
+            const isPaper = (effectiveFormat === 'paper');
+
+            let clientFee = 0.0;
+            if (draft.rows && draft.rows.length > 0) {
+                let baseFee = 0;
+                let discountFee = 0;
+
+                draft.rows.forEach(r => {
+                    const feeVal = Math.abs(r.fee || 0);
+                    const serviceName = (r.service || '').toLowerCase();
+
+                    if (serviceName.includes('discount') || serviceName.includes('referral')) {
+                        discountFee += feeVal;
+                    } else {
+                        baseFee += feeVal;
+                    }
+                });
+
+                clientFee = baseFee - discountFee;
+            }
+
+            const pSigner = draft.primary_signer || {};
+            const coSigner = draft.co_signer || {};
+
+            const isDataIncomplete = isProfileIncomplete(client, draft);
+
+            const isApproved = Boolean(draft.is_approved === true);
+            const reviewedBy = draft.reviewed_by || '';
+            const reviewedAt = draft.reviewed_at || '';
+
+            const entityType = draft.entity_type || meta.entity_type || 'individual';
+            const engTitle = draft.engagement_title || `Engagement #${engId}`;
+
+            const clientNameClean = clientKey.split(' (Customer')[0] || pSigner.friendly_name || draft.friendly_name || meta.friendly_name;
+
+            const questionnaireStatus = draft.questionnaire_status || 'unsent';
+
+            const searchableText = `${qboId} ${clientNameClean} ${engTitle} ${entityType} ${clientFee} ${reviewedBy} ${questionnaireStatus}`.toLowerCase();
+            const completion = parseAdobeCompletion(draft.adobe_completed_at);
+
+            // Both Signed (+) and Cancelled (!) are terminal finalized states
+            const isFinalized = completion.isSigned || completion.isCancelled;
+
+            const matchesSearch = searchableText.includes(searchQuery);
+            let matchesFilter = true;
+
+            // Only filter when "Not Finalized" is chosen; "All Engagements" lets everything pass
+            if (formatFilter === 'not_finalized') {
+                matchesFilter = !isFinalized; // Excludes both Signed (+) and Cancelled (!)
+            }
+
+            if (matchesSearch && matchesFilter) {
+                allRecords.push({
+                    qboId, engId, clientKey, client, draft, isLocked, isPaper,
+                    clientFee, entityType,
+                    isDataIncomplete, isApproved, reviewedBy, reviewedAt, clientNameClean, engTitle,
+                    questionnaireStatus
+                });
+            }
+        });
+    });
+
+    if (currentSortColumn !== null) {
+        allRecords.sort((a, b) => {
+            let valA, valB;
+
+            // Rank Status Priority:
+            const getStatusRank = (rec) => {
+                const comp = parseAdobeCompletion(rec.draft && rec.draft.adobe_completed_at);
+
+                if (comp.isCancelled) return 5;     // Rank 5: Cancelled / Terminated
+                if (comp.isSigned) return 4;        // Rank 4: Signed / Executed
+                if (rec.isLocked) return 3;         // Rank 3: Out for Signature
+                if (rec.isDataIncomplete) return 0; // Rank 0: Incomplete Data
+                if (rec.isApproved) return 2;       // Rank 2: Approved
+                return 1;                           // Rank 1: Needs Review
+            };
+
+            const getQuestRank = (rec) => {
+                const st = (rec.questionnaireStatus || 'unsent').toLowerCase();
+                if (st === 'returned') return 2;
+                if (st === 'delivered') return 1;
+                return 0; // unsent
+            };
+
+            switch (currentSortColumn) {
+                case 1: 
+                    valA = parseInt(a.qboId, 10) || 0; 
+                    valB = parseInt(b.qboId, 10) || 0; 
+                    break;
+                case 2: 
+                    valA = (a.clientNameClean || '').toLowerCase(); 
+                    valB = (b.clientNameClean || '').toLowerCase(); 
+                    break;
+                case 3: 
+                    valA = (a.entityType || '').toLowerCase(); 
+                    valB = (b.entityType || '').toLowerCase(); 
+                    break;
+                case 4: 
+                    valA = Number(a.clientFee) || 0; 
+                    valB = Number(b.clientFee) || 0; 
+                    break;
+                case 5:
+                    valA = getQuestRank(a);
+                    valB = getQuestRank(b);
+                    break;
+                case 6: 
+                    valA = a.isPaper ? 1 : 0; 
+                    valB = b.isPaper ? 1 : 0; 
+                    break;
+                case 7: 
+                    valA = getStatusRank(a); 
+                    valB = getStatusRank(b); 
+                    break;
+                default: 
+                    valA = 0; 
+                    valB = 0;
+            }
+
+            let comparison = 0;
+            if (typeof valA === 'number' && typeof valB === 'number') {
+                comparison = valA - valB;
+            } else {
+                comparison = String(valA).localeCompare(String(valB));
+            }
+
+            return currentSortAscending ? comparison : -comparison;
+        });
+    }
+
+    return allRecords;
+}
+
+function renderBatchTableGrid() {
+    const tbody = document.getElementById('batch-tbody');
+    if (!tbody || !window.clientData) return;
+
+    const filteredRows = getFilteredBatchRows();
+    const totalFilteredCount = filteredRows.length;
+
+    let paginatedSlice = filteredRows;
+    if (batchPageSize !== 'all') {
+        const totalPages = Math.max(1, Math.ceil(totalFilteredCount / batchPageSize));
+        if (batchCurrentPage > totalPages) batchCurrentPage = totalPages;
+
+        const startIndex = (batchCurrentPage - 1) * batchPageSize;
+        paginatedSlice = filteredRows.slice(startIndex, startIndex + batchPageSize);
+    }
+
+    tbody.innerHTML = '';
+
+    paginatedSlice.forEach(item => {
+        const { qboId, engId, draft, isLocked, isPaper, clientFee, entityType, isDataIncomplete, isApproved, reviewedBy, clientNameClean, engTitle, questionnaireStatus } = item;
+        const selectionKey = `${qboId}:${engId}`;
+        const isChecked = Boolean(globalBatchSelections[selectionKey]);
+
+        const badgeClickAttr = `onclick="openBatchEditModal('${qboId}', '${engId}')" title="Click to review services and fees"`;
+
+        const completion = parseAdobeCompletion(draft.adobe_completed_at);
+
+        let statusBadge = `<span class="badge badge-needs-review badge-clickable" ${badgeClickAttr}>🔍 Needs Review</span>`;
+
+        // 1. Check for explicit paper wet-signature or questionnaire sign-off
+        if (draft.acceptance_type === 'paper_wet_signature') {
+            statusBadge = `<span class="badge badge-approved" title="Physical wet-ink paper signature received and recorded">✅ Wet Sig</span>`;
+        } else if (draft.acceptance_type === 'questionnaire_implicit_consent') {
+            statusBadge = `<span class="badge badge-approved" title="Sign-off completed via digital questionnaire consent">✅ Consent</span>`;
+        }
+        // 2. Check for electronic e-sign completion status from Adobe Sign
+        else if (completion.isCancelled) {
+            statusBadge = `<span class="badge badge-clickable" ${badgeClickAttr} style="background: #fee2e2; color: #dc2626; border: 1px solid #fca5a5;" title="Cancelled/Declined in Adobe Sign (${escapeHtml(completion.date)})">🚫 Cancelled</span>`;
+        } else if (completion.isSigned) {
+            const pdfUrl = `${window.location.pathname}?action=view_signed_pdf&client_name=${encodeURIComponent(qboId)}&engagement_id=${encodeURIComponent(engId)}`;
+            statusBadge = `<a href="${pdfUrl}" target="_blank" class="badge badge-approved badge-clickable" style="text-decoration: none;" title="Signed on ${escapeHtml(completion.date)}">✅ Signed 📄</a>`;
+        } 
+        // 3. Handle active locked state (dispatched agreements awaiting signature)
+        else if (isLocked) {
+            statusBadge = `<span class="badge badge-warning" title="${isPaper ? 'Paper agreement printed/dispatched' : 'E-signature pending via Adobe Sign'}">Out for Signature</span>`;
+        } 
+        // 4. Fallback pre-dispatch review states
+        else if (isDataIncomplete) {
+            statusBadge = `<span class="badge badge-warning badge-clickable" ${badgeClickAttr}>⚠️ Data Incomplete</span>`;
+        } else if (isApproved) {
+            const byText = reviewedBy ? ` (${escapeHtml(reviewedBy)})` : '';
+            statusBadge = `<span class="badge badge-info badge-clickable" ${badgeClickAttr}>✅ Approved${byText}</span>`;
+        }
+
+        let questBadgeClass = 'badge-quest-unsent';
+        let questBadgeText = '⚪ Unsent 🔄';
+        if (questionnaireStatus === 'delivered') {
+            questBadgeClass = 'badge-quest-delivered';
+            questBadgeText = '📬 Delivered 🔄';
+        } else if (questionnaireStatus === 'returned') {
+            const consentType = draft.acceptance_type === 'questionnaire_implicit_consent' ? ' (Consent)' : '';
+            questBadgeClass = 'badge-quest-returned';
+            questBadgeText = `✅ Returned${consentType} 🔄`;
+        }
+
+        const questBadge = `
+            <span class="badge ${questBadgeClass}" 
+                  onclick="cycleClientQuestionnaireStatus('${qboId}', '${engId}')" 
+                  title="Click to cycle questionnaire status (Unsent → Delivered → Returned)" 
+                  style="cursor: pointer; user-select: none;">
+                ${questBadgeText}
+            </span>
+        `;
+
+        const checkedAttr = isChecked ? 'checked' : '';
+        const formatBadgeClass = isPaper ? 'badge-paper' : 'badge-electronic';
+        const formatText = isPaper ? 'Paper' : 'Electronic';
+        const disabledCursor = isLocked ? 'cursor: default;' : 'cursor: pointer;';
+
+        const formatBadgeHtml = `
+            <span class="badge ${formatBadgeClass}" 
+                  onclick="${isLocked ? '' : `toggleClientDeliveryFormat('${qboId}', '${engId}')`}" 
+                  title="${isLocked ? 'Locked' : 'Click to toggle delivery format'}" 
+                  style="${disabledCursor} user-select: none;">
+                ${formatText} 🔄
+            </span>
+        `;
+
+        const tr = document.createElement('tr');
+        tr.id = `batch_row_${qboId}_${engId}`;
+        tr.className = `batch-row-item format-${isPaper ? 'paper' : 'electronic'}`;
+        tr.innerHTML = `
+            <td style="text-align: center;">
+                <input type="checkbox" class="batch-checkbox" data-qbo-id="${qboId}" data-eng-id="${engId}" ${checkedAttr} onchange="handleBatchCheckboxToggle('${qboId}', '${engId}', this.checked)">
+            </td>
+            <td style="font-family: monospace; font-size: 12px; color: #555;">${qboId}</td>
+            <td style="padding: 4px 8px;">
+                <a href="javascript:void(0)" 
+                   onclick="openSingleWorkspaceForClient('${qboId}', '${engId}')" 
+                   style="color: #0078d4; font-weight: 700; text-decoration: underline; cursor: pointer;"
+                   title="Open Full Single Engagement Workspace">
+                    ${escapeHtml(clientNameClean)}
+                </a>
+                <br/><small style="color: #475569; font-weight: 600;">${escapeHtml(engTitle)}</small>
+            </td>
+            <td><span class="badge ${entityType === 'individual' ? 'badge-individual' : 'badge-organization'}">${escapeHtml(entityType)}</span></td>
+            <td style="text-align: right; font-family: monospace; font-weight: bold; font-size: 14px;">$${Math.round(clientFee).toLocaleString()}</td>
+            <td>${questBadge}</td>
+            <td>${formatBadgeHtml}</td>
+            <td>${statusBadge}</td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    updateSortIndicators();
+    updatePaginationUI(totalFilteredCount);
+    updateBatchSummaryMetrics();
+}
+
+function updateSortIndicators() {
+    document.querySelectorAll('.batch-table th.sortable-th').forEach(th => {
+        const thColIdx = parseInt(th.getAttribute('data-col-index'), 10);
+        const indicator = th.querySelector('.sort-indicator');
+        if (indicator) {
+            indicator.innerText = (thColIdx === currentSortColumn) ? (currentSortAscending ? ' ▲' : ' ▼') : ' ⇅';
+        }
+    });
+}
+
+function updatePaginationUI(totalItems) {
+    const pageInfos = document.querySelectorAll('.batch-page-info');
+    const prevBtns = document.querySelectorAll('.btn-prev-page');
+    const nextBtns = document.querySelectorAll('.btn-next-page');
+
+    if (batchPageSize === 'all') {
+        pageInfos.forEach(el => el.innerText = `Showing all ${totalItems} engagements`);
+        prevBtns.forEach(btn => btn.disabled = true);
+        nextBtns.forEach(btn => btn.disabled = true);
+        return;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(totalItems / batchPageSize));
+    const startNum = totalItems === 0 ? 0 : (batchCurrentPage - 1) * batchPageSize + 1;
+    const endNum = Math.min(batchCurrentPage * batchPageSize, totalItems);
+
+    pageInfos.forEach(el => el.innerText = `Showing ${startNum}–${endNum} of ${totalItems} engagements (Page ${batchCurrentPage} of ${totalPages})`);
+    prevBtns.forEach(btn => btn.disabled = (batchCurrentPage <= 1));
+    nextBtns.forEach(btn => btn.disabled = (batchCurrentPage >= totalPages));
+}
+
+function updateBatchSummaryMetrics() {
+    if (!window.clientData) return;
+
+    let selectedCount = 0;
+
+    Object.keys(window.clientData).forEach(clientKey => {
+        const client = window.clientData[clientKey];
+        const qboId = String(client.id);
+        const engagements = client.engagements || {};
+
+        Object.keys(engagements).forEach(engId => {
+            if (globalBatchSelections[`${qboId}:${engId}`]) {
+                selectedCount++;
+            }
+        });
+    });
+
+    const applyBtn = document.getElementById('btn-batch-apply-action');
+    if (applyBtn) {
+        applyBtn.innerText = selectedCount > 0 ? `Apply (${selectedCount})` : 'Apply';
+        applyBtn.disabled = selectedCount === 0;
+    }
+}
+
+function filterBatchTableGrid() {
+    batchCurrentPage = 1;
+    renderBatchTableGrid();
+}
+
+function toggleMasterBatchCheckbox(masterChecked) {
+    const filteredRows = getFilteredBatchRows();
+    filteredRows.forEach(item => {
+        globalBatchSelections[`${item.qboId}:${item.engId}`] = masterChecked;
+    });
+    renderBatchTableGrid();
+}
+
+function toggleClientDeliveryFormat(qboId, engId) {
+    let targetDraft = null;
+    for (const k in window.clientData) {
+        if (String(window.clientData[k].id) === String(qboId)) {
+            targetDraft = window.clientData[k].engagements?.[engId];
+            break;
+        }
+    }
+
+    if (!targetDraft || targetDraft.is_locked) return;
+
+    // Flip value in memory
+    const newFmt = (targetDraft.delivery_format === 'paper') ? 'electronic' : 'paper';
+    targetDraft.delivery_format = newFmt;
+
+    // Optimistically update UI
+    renderBatchTableGrid();
+
+    // Dispatch minimal patch payload
+    const params = new URLSearchParams();
+    params.append('action', 'patch_draft_only');
+    params.append('client_name', qboId);
+    params.append('engagement_id', engId);
+    params.append('delivery_format', newFmt);
+
+    fetch(window.location.href, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+    }).catch(err => console.error('Error saving format preference:', err));
+}
+
+function cycleClientQuestionnaireStatus(qboId, engId) {
+    let targetDraft = null;
+    for (const k in window.clientData) {
+        if (String(window.clientData[k].id) === String(qboId)) {
+            targetDraft = window.clientData[k].engagements?.[engId];
+            break;
+        }
+    }
+
+    if (!targetDraft) return;
+
+    const currentStatus = (targetDraft.questionnaire_status || 'unsent').toLowerCase();
+    const nextStatus = currentStatus === 'unsent'
+        ? 'delivered'
+        : currentStatus === 'delivered'
+            ? 'returned'
+            : 'unsent';
+
+    targetDraft.questionnaire_status = nextStatus;
+
+    // Optimistically update UI
+    renderBatchTableGrid();
+
+    // Persist to draft JSON (preserve lock state if already locked)
+    const params = new URLSearchParams();
+    params.append('action', 'patch_draft_only');
+    params.append('client_name', qboId);
+    params.append('engagement_id', engId);
+    params.append('questionnaire_status', nextStatus);
+    if (targetDraft.is_locked) {
+        params.append('is_locked', 'true');
+    }
+
+    fetch(window.location.href, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+    }).catch(err => console.error('Error saving questionnaire status:', err));
+}
+
+// ==========================================
+// BATCH ACTION DISPATCH ROUTER
+// ==========================================
+
+function handleBatchActionExecution() {
+    const actionSelect = document.getElementById('batch-action-select');
+    if (!actionSelect) return;
+
+    const actionValue = actionSelect.value;
+    const targetKeys = Object.keys(globalBatchSelections).filter(k => globalBatchSelections[k] === true);
+
+    if (targetKeys.length === 0) {
+        alert('Please select at least one engagement record from the grid.');
+        return;
+    }
+
+    switch (actionValue) {
+        case 'submit_batch':
+            executeBatchPipelineSubmission();
+            break;
+        case 'print_paper_packets':
+            executePrintPaperPackets(targetKeys);
+            break;
+        case 'record_paper_signature':
+            openRecordPaperSignatureModal(targetKeys);
+            break;
+        case 'send_adobe_reminder':
+            executeSendAdobeReminders(targetKeys);
+            break;
+        case 'email_welcome_letter':
+            executeEmailWelcomeLettersOnly(targetKeys);
+            break;
+        default:
+            alert('Please select a valid batch action to perform.');
+    }
+}
+
+function executePrintPaperPackets(targetKeys) {
+    if (!Array.isArray(targetKeys) || targetKeys.length === 0) {
+        alert('Please select at least one engagement record from the grid.');
+        return;
+    }
+
+    // Submit via native hidden POST form to trigger clean browser PDF attachment download
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = window.location.pathname;
+    form.style.display = 'none';
+
+    const actionInput = document.createElement('input');
+    actionInput.type = 'hidden';
+    actionInput.name = 'action';
+    actionInput.value = 'print_paper_packets';
+    form.appendChild(actionInput);
+
+    targetKeys.forEach(key => {
+        const keyInput = document.createElement('input');
+        keyInput.type = 'hidden';
+        keyInput.name = 'packet_keys';
+        keyInput.value = key;
+        form.appendChild(keyInput);
+    });
+
+    document.body.appendChild(form);
+    form.submit();
+    document.body.removeChild(form);
+}
+
+function openRecordPaperSignatureModal(targetKeys) {
+    const modal = document.getElementById('paper-signature-modal');
+    if (!modal) {
+        // Fallback prompt if modal container is absent
+        const isImplicit = confirm(`Record paper agreement acceptance for ${targetKeys.length} client(s)?\n\nClick [OK] for Explicit Wet Signature, or [Cancel] for Implicit Questionnaire Consent.`);
+        executeRecordPaperSignature(targetKeys, isImplicit ? 'paper_wet_signature' : 'questionnaire_implicit_consent');
+        return;
+    }
+
+    const countSpan = document.getElementById('paper-modal-count');
+    if (countSpan) countSpan.innerText = targetKeys.length;
+
+    modal.style.display = 'flex';
+}
+
+function closeRecordPaperSignatureModal() {
+    const modal = document.getElementById('paper-signature-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+function confirmRecordPaperSignatureModal() {
+    const targetKeys = Object.keys(globalBatchSelections).filter(k => globalBatchSelections[k] === true);
+    const selectedRadio = document.querySelector('input[name="paper_acceptance_type"]:checked');
+    const acceptanceType = selectedRadio ? selectedRadio.value : 'paper_wet_signature';
+
+    closeRecordPaperSignatureModal();
+    executeRecordPaperSignature(targetKeys, acceptanceType);
+}
+
+async function executeRecordPaperSignature(targetKeys, acceptanceType) {
+    const overlay = document.getElementById('batch-progress-overlay');
+    const terminalLog = document.getElementById('batch-terminal-log');
+    const progressBar = document.getElementById('batch-progress-fill');
+    const closeBtn = document.getElementById('btn-close-progress');
+
+    if (overlay) overlay.style.display = 'flex';
+    if (closeBtn) closeBtn.style.display = 'none';
+    if (terminalLog) terminalLog.innerHTML = `Recording paper acceptance (${acceptanceType}) for ${targetKeys.length} account(s)...\n`;
+
+    let completed = 0;
+
+    for (const key of targetKeys) {
+        const [qboId, engId] = key.split(':');
+        let clientObj = null;
+        for (const k in window.clientData) {
+            if (String(window.clientData[k].id) === String(qboId)) {
+                clientObj = window.clientData[k];
+                break;
+            }
+        }
+
+        const draft = clientObj?.engagements?.[engId];
+        if (draft) {
+            draft.acceptance_type = acceptanceType;
+            draft.is_locked = true;
+        }
+
+        const params = new URLSearchParams();
+        params.append('action', 'patch_draft_only');
+        params.append('client_name', qboId);
+        params.append('engagement_id', engId);
+        params.append('is_locked', 'true');
+        params.append('acceptance_type', acceptanceType);
+
+        try {
+            await fetch(window.location.href, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: params.toString()
+            });
+            terminalLog.innerHTML += `\n[${completed + 1}/${targetKeys.length}] Recorded QBO ${qboId} / Eng ${engId} ✔`;
+        } catch (err) {
+            terminalLog.innerHTML += `\n[${completed + 1}/${targetKeys.length}] Failed QBO ${qboId} / Eng ${engId}: ${err.message}`;
+        }
+
+        completed++;
+        if (progressBar) progressBar.style.width = `${(completed / targetKeys.length) * 100}%`;
+    }
+
+    terminalLog.innerHTML += `\n\n========================================\nPaper signature recording complete!`;
+    if (closeBtn) closeBtn.style.display = 'inline-block';
+    renderBatchTableGrid();
+}
+
+async function executeSendAdobeReminders(targetKeys) {
+    const overlay = document.getElementById('batch-progress-overlay');
+    const terminalLog = document.getElementById('batch-terminal-log');
+    const progressBar = document.getElementById('batch-progress-fill');
+    const closeBtn = document.getElementById('btn-close-progress');
+
+    if (overlay) overlay.style.display = 'flex';
+    if (closeBtn) closeBtn.style.display = 'none';
+    if (terminalLog) terminalLog.innerHTML = `Sending Adobe Sign reminders to ${targetKeys.length} account(s)...\n`;
+
+    let completed = 0;
+
+    for (const key of targetKeys) {
+        const [qboId, engId] = key.split(':');
+        const params = new URLSearchParams();
+        params.append('action', 'send_adobe_reminder');
+        params.append('client_name', qboId);
+        params.append('engagement_id', engId);
+
+        try {
+            await fetch(window.location.href, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: params.toString()
+            });
+            terminalLog.innerHTML += `\n[${completed + 1}/${targetKeys.length}] Reminder Sent for QBO ${qboId} / Eng ${engId} ✔`;
+        } catch (err) {
+            terminalLog.innerHTML += `\n[${completed + 1}/${targetKeys.length}] Failed QBO ${qboId}: ${err.message}`;
+        }
+
+        completed++;
+        if (progressBar) progressBar.style.width = `${(completed / targetKeys.length) * 100}%`;
+    }
+
+    terminalLog.innerHTML += `\n\n========================================\nReminder dispatch complete!`;
+    if (closeBtn) closeBtn.style.display = 'inline-block';
+}
+
+async function executeEmailWelcomeLettersOnly(targetKeys) {
+    const overlay = document.getElementById('batch-progress-overlay');
+    const terminalLog = document.getElementById('batch-terminal-log');
+    const progressBar = document.getElementById('batch-progress-fill');
+    const closeBtn = document.getElementById('btn-close-progress');
+
+    if (overlay) overlay.style.display = 'flex';
+    if (closeBtn) closeBtn.style.display = 'none';
+    if (terminalLog) terminalLog.innerHTML = `Dispatching Welcome Letters to ${targetKeys.length} account(s)...\n`;
+
+    let completed = 0;
+
+    for (const key of targetKeys) {
+        const [qboId, engId] = key.split(':');
+        let clientObj = null;
+        for (const k in window.clientData) {
+            if (String(window.clientData[k].id) === String(qboId)) {
+                clientObj = window.clientData[k];
+                break;
+            }
+        }
+
+        const draft = clientObj?.engagements?.[engId];
+        if (draft) {
+            draft.questionnaire_status = 'delivered';
+        }
+
+        const params = new URLSearchParams();
+        params.append('action', 'email_welcome_letter_only');
+        params.append('client_name', qboId);
+        params.append('engagement_id', engId);
+        params.append('questionnaire_status', 'delivered');
+
+        try {
+            await fetch(window.location.href, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: params.toString()
+            });
+            terminalLog.innerHTML += `\n[${completed + 1}/${targetKeys.length}] Welcome Letter Dispatched QBO ${qboId} / Eng ${engId} ✔`;
+        } catch (err) {
+            terminalLog.innerHTML += `\n[${completed + 1}/${targetKeys.length}] Failed QBO ${qboId}: ${err.message}`;
+        }
+
+        completed++;
+        if (progressBar) progressBar.style.width = `${(completed / targetKeys.length) * 100}%`;
+    }
+
+    terminalLog.innerHTML += `\n\n========================================\nWelcome Letter dispatch complete!`;
+    if (closeBtn) closeBtn.style.display = 'inline-block';
+    renderBatchTableGrid();
+}
+
+// ==========================================
+// BATCH MODAL EDITING & BULK ACTIONS
+// ==========================================
+
+function openBatchEditModal(qboId, engId) {
+    const modal = document.getElementById('batch-edit-modal');
+    const container = document.getElementById('modal-workspace-container');
+    if (!modal || !container) return;
+
+    let clientObj = null;
+    let clientKeyName = '';
+    for (const k in window.clientData) {
+        if (String(window.clientData[k].id) === String(qboId)) {
+            clientObj = window.clientData[k];
+            clientKeyName = k;
+            break;
+        }
+    }
+
+    if (!clientObj) return;
+
+    const draft = clientObj.engagements?.[engId] || {};
+    const titleEl = document.getElementById('modal-client-title');
+
+    if (titleEl) {
+        titleEl.innerText = `Quick Review & Sign-Off: ${clientKeyName.split(' (Customer')[0]} (#${engId})`;
+    }
+
+    container.setAttribute('data-qbo-id', qboId);
+    container.setAttribute('data-eng-id', engId);
+
+    let serviceRowsHtml = '';
+    const rows = (draft.rows && draft.rows.length > 0) ? draft.rows : [{ item_id: '', service: '', fee: '', notes: '' }];
+
+    rows.forEach((r) => {
+        const rowId = `m_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+        let resolvedItemId = r.item_id || '';
+        let selectedOptionValue = r.service || '';
+        const defaultSelected = (!r.service && !resolvedItemId) ? 'selected' : '';
+        let optionsHtml = '<option value="" disabled ' + defaultSelected + '>-- Select Service Item --</option>';
+
+        if (clientObj.exposed_services) {
+            clientObj.exposed_services.forEach(s => {
+                let sel = '';
+                const cleanSvc = (r.service || '').trim().toLowerCase();
+
+                if (cleanSvc) {
+                    // Prioritize explicit service name match
+                    sel = (s.name.trim().toLowerCase() === cleanSvc) ? 'selected' : '';
+                } else if (r.item_id) {
+                    // Fallback to item ID match only when no service name exists
+                    sel = (String(s.id) === String(r.item_id)) ? 'selected' : '';
+                }
+
+                if (sel) {
+                    resolvedItemId = s.id;
+                    selectedOptionValue = s.name;
+                }
+                optionsHtml += `<option value="${escapeHtml(s.name)}" data-item-id="${s.id}" data-service-name="${escapeHtml(s.name)}" data-fee="${s.fee}" data-notes="${escapeHtml(s.notes)}" ${sel}>${escapeHtml(s.name)}</option>`;
+            });
+        }
+
+        serviceRowsHtml += `
+            <tr id="service_row_${rowId}">
+                <td style="text-align: center; width: 40px; padding-top: 16px;">
+                    <button type="button" class="btn-remove-row" onclick="removeServiceRow('${rowId}')" title="Remove Line Item">×</button>
+                    <input type="hidden" name="selected_rows" value="${rowId}">
+                    <input type="hidden" name="row_item_id_${rowId}" id="row_item_id_${rowId}" value="${escapeHtml(resolvedItemId)}">
+                </td>
+                <td>
+                    <select name="row_service_${rowId}" id="row_service_${rowId}" style="width: 100%; padding: 8px;" required onchange="onServiceDropdownChange('${rowId}')">
+                        ${optionsHtml}
+                    </select>
+                </td>
+                <td style="white-space: nowrap; width: 140px;">
+                    <span style="position: relative; font-family: monospace; font-size: 15px; top: 4px;">
+                        $ <input type="number" name="row_fee_${rowId}" id="row_fee_${rowId}" step="1" min="-99999" value="${r.fee !== undefined && r.fee !== null ? r.fee : ''}" placeholder="0" oninput="recalculateTotals()" style="width: 90px; padding: 6px; margin-left: 6px;" required>
+                    </span>
+                </td>
+                <td class="notes-cell">
+                    <textarea name="row_notes_${rowId}" id="row_notes_${rowId}" placeholder="Scope notes or specifications..." style="width: 100%; height: 46px; font-family: inherit; font-size: 13px; padding: 6px; box-sizing: border-box; resize: vertical;">${escapeHtml(r.notes || '')}</textarea>
+                </td>
+            </tr>
+        `;
+    });
+
+    container.innerHTML = `
+        <div style="margin-bottom: 12px;">
+            ${renderApprovalCardHtml(draft)}
+        </div>
+
+        <table class="service-table" style="width: 100%; margin-top: 10px; margin-bottom: 15px;">
+            <thead>
+                <tr>
+                    <th style="text-align:center; width:45px;">Action</th>
+                    <th style="width:30%;">Service Item Offering</th>
+                    <th style="width:140px; text-align:right; white-space:nowrap;">Proposed Amount</th>
+                    <th>Scope Specification / Notes</th>
+                </tr>
+            </thead>
+            <tbody id="service-tbody">
+                ${serviceRowsHtml}
+            </tbody>
+            <tfoot>
+                <tr style="background:#fafafa;">
+                    <td colspan="2" style="text-align:right; font-weight:700; padding:10px; color:#b76200;">Client Discount:</td>
+                    <td id="ui-total-discount" class="calc-val" style="padding:10px; text-align:right; color:#b76200;">-$0</td>
+                    <td></td>
+                </tr>
+                <tr class="calc-row-balance">
+                    <td colspan="2" style="text-align:right; font-weight:700; padding:10px;">TOTAL FEES:</td>
+                    <td id="ui-total-balance" class="calc-val" style="padding:10px; text-align:right;">$0</td>
+                    <td></td>
+                </tr>
+            </tfoot>
+        </table>
+
+        <div style="margin-bottom: 15px;">
+            <button type="button" class="btn-add-row" onclick="addServiceRow()">+ Add Service Line Item</button>
+        </div>
+    `;
+
+    modal.style.display = 'flex';
+    recalculateTotals();
+}
+
+function closeBatchEditModal() {
+    const modal = document.getElementById('batch-edit-modal');
+    const container = document.getElementById('modal-workspace-container');
+
+    if (container) {
+        const qboId = container.getAttribute('data-qbo-id');
+        const engId = container.getAttribute('data-eng-id');
+
+        const isApprovedCheckbox = container.querySelector('#is_approved_checkbox') || document.getElementById('is_approved_checkbox');
+        const initialsInput = container.querySelector('#reviewed_by_input') || document.getElementById('reviewed_by_input');
+        const timestampInput = container.querySelector('#reviewed_at_input') || document.getElementById('reviewed_at_input');
+
+        if (qboId && engId) {
+            let clientObj = null;
+            for (const k in window.clientData) {
+                if (String(window.clientData[k].id) === String(qboId)) {
+                    clientObj = window.clientData[k];
+                    break;
+                }
+            }
+
+            if (clientObj && clientObj.engagements?.[engId]) {
+                const targetDraft = clientObj.engagements[engId];
+                const newApprovedState = Boolean(isApprovedCheckbox && isApprovedCheckbox.checked);
+
+                targetDraft.is_approved = newApprovedState;
+                targetDraft.reviewed_by = initialsInput ? initialsInput.value.trim().toUpperCase() : '';
+                targetDraft.reviewed_at = timestampInput ? timestampInput.value.trim() : '';
+
+                const modalRows = [];
+                const tbody = container.querySelector('#service-tbody');
+                if (tbody) {
+                    const trs = tbody.querySelectorAll('tr');
+                    trs.forEach(tr => {
+                        const rowIdInput = tr.querySelector('input[name="selected_rows"]');
+                        if (rowIdInput) {
+                            const rowId = rowIdInput.value;
+                            const itemId = tr.querySelector(`#row_item_id_${rowId}`)?.value || '';
+                            const selectEl = tr.querySelector(`#row_service_${rowId}`);
+
+                            let serviceName = '';
+                            if (selectEl && selectEl.selectedIndex >= 0) {
+                                const selectedOption = selectEl.options[selectEl.selectedIndex];
+                                serviceName = selectedOption.getAttribute('data-service-name') || selectedOption.value || selectedOption.text.replace(/\s*\(\$[\d,]+\)$/, '').trim();
+                            }
+
+                            const fee = parseInt(tr.querySelector(`#row_fee_${rowId}`)?.value, 10) || 0;
+                            const notes = tr.querySelector(`#row_notes_${rowId}`)?.value || '';
+                            if (itemId || serviceName) {
+                                modalRows.push({ item_id: itemId, service: serviceName, fee: fee, notes: notes });
+                            }
+                        }
+                    });
+
+                    targetDraft.rows = modalRows;
+                }
+
+                const params = new URLSearchParams();
+                params.append('action', 'patch_draft_only');
+                params.append('client_name', qboId);
+                params.append('engagement_id', engId);
+                params.append('is_approved', newApprovedState ? 'true' : 'false');
+                params.append('reviewed_by', targetDraft.reviewed_by || '');
+                params.append('reviewed_at', targetDraft.reviewed_at || '');
+
+                const safeRows = Array.isArray(targetDraft.rows) ? targetDraft.rows : [];
+                safeRows.forEach((r, idx) => {
+                    const rid = idx + 1;
+                    params.append('selected_rows', rid);
+                    params.append(`row_item_id_${rid}`, r.item_id || '');
+                    params.append(`row_service_${rid}`, r.service || '');
+                    params.append(`row_fee_${rid}`, r.fee || 0);
+                    params.append(`row_notes_${rid}`, r.notes || '');
+                });
+
+                // Preserve out of scope items when patching draft from Quick Review Modal
+                if (targetDraft.out_of_scope_items && typeof targetDraft.out_of_scope_items === 'object') {
+                    params.append('oos_submitted', 'true');
+                    Object.entries(targetDraft.out_of_scope_items).forEach(([k, v]) => {
+                        params.append(k, v);
+                    });
+                }
+
+                fetch(window.location.href, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: params.toString()
+                })
+                .then(() => {
+                    renderBatchTableGrid();
+                })
+                .catch(err => console.error('Error saving engagement draft:', err));
+            }
+        }
+
+        container.innerHTML = '';
+    }
+
+    if (modal) modal.style.display = 'none';
+    renderBatchTableGrid();
+}
+
+function cancelBatchEditModal() {
+    const modal = document.getElementById('batch-edit-modal');
+    const container = document.getElementById('modal-workspace-container');
+    if (modal) modal.style.display = 'none';
+    if (container) container.innerHTML = '';
+}
+
+async function executeBatchPipelineSubmission() {
+    const targetKeys = Object.keys(globalBatchSelections).filter(k => globalBatchSelections[k] === true);
+    if (targetKeys.length === 0) return alert('No valid, approved engagements selected.');
+
+    const unapprovedKeys = targetKeys.filter(key => {
+        const [qboId, engId] = key.split(':');
+        let clientObj = null;
+        for (const k in window.clientData) {
+            if (String(window.clientData[k].id) === String(qboId)) {
+                clientObj = window.clientData[k];
+                break;
+            }
+        }
+        const draft = clientObj?.engagements?.[engId];
+        return !draft || draft.is_approved !== true;
+    });
+
+    if (unapprovedKeys.length > 0) {
+        alert(`Execution halted: ${unapprovedKeys.length} selected engagement(s) have not been reviewed and approved yet.`);
+        return;
+    }
+
+    if (!confirm(`Are you sure you want to process and dispatch ${targetKeys.length} selected engagement(s)?`)) return;
+
+    const overlay = document.getElementById('batch-progress-overlay');
+    const terminalLog = document.getElementById('batch-terminal-log');
+    const progressBar = document.getElementById('batch-progress-fill');
+    const closeBtn = document.getElementById('btn-close-progress');
+
+    if (overlay) overlay.style.display = 'flex';
+    if (closeBtn) closeBtn.style.display = 'none';
+    if (terminalLog) terminalLog.innerHTML = `Starting batch process for ${targetKeys.length} engagement(s)...\n`;
+
+    let completed = 0;
+
+    for (const key of targetKeys) {
+        const [qboId, engId] = key.split(':');
+
+        let clientKey = '';
+        let clientObj = null;
+        for (const k in window.clientData) {
+            if (String(window.clientData[k].id) === String(qboId)) {
+                clientObj = window.clientData[k];
+                clientKey = k;
+                break;
+            }
+        }
+
+        const draft = clientObj?.engagements?.[engId] || {};
+        const isPaper = (draft.delivery_format === 'paper');
+
+        const params = new URLSearchParams();
+        params.append('ajax', 'true');
+        params.append('action', isPaper ? 'execute_transactional_pipeline_paper' : 'execute_transactional_pipeline');
+        params.append('client_name', clientKey || qboId);
+        params.append('engagement_id', engId);
+        params.append('engagement_title', draft.engagement_title || '2026 Tax Services Agreement');
+        params.append('delivery_format', draft.delivery_format || 'electronic');
+        params.append('include_cover_letter', 'true');
+
+        // Signer & Contact Information
+        const pSigner = draft.primary_signer || {};
+        const coSigner = draft.co_signer || {};
+        const bAddr = draft.billing_address || {};
+
+        params.append('friendly_name', pSigner.friendly_name || draft.friendly_name || clientObj?.metadata?.friendly_name || '');
+        params.append('legal_name', pSigner.legal_name || draft.legal_name || '');
+        params.append('primary_signer_email', pSigner.email || draft.primary_signer_email || clientObj?.metadata?.primary_signer_email || clientObj?.email || '');
+        params.append('co_signer_name', coSigner.name || draft.co_signer_name || clientObj?.metadata?.co_signer_name || '');
+        params.append('co_signer_email', coSigner.email || draft.co_signer_email || clientObj?.metadata?.co_signer_email || '');
+        params.append('phone', draft.phone || clientObj?.metadata?.phone || clientObj?.phone || '');
+        params.append('entity_type', draft.entity_type || clientObj?.metadata?.entity_type || 'individual');
+
+        params.append('street', bAddr.street || clientObj?.address?.street || '');
+        params.append('city', bAddr.city || clientObj?.address?.city || '');
+        params.append('state', bAddr.state || clientObj?.address?.state || '');
+        params.append('zip', bAddr.zip || clientObj?.address?.zip || '');
+
+        // Service Line Items
+        if (Array.isArray(draft.rows)) {
+            draft.rows.forEach((r, idx) => {
+                const rid = idx + 1;
+                params.append('selected_rows', rid);
+                params.append(`row_item_id_${rid}`, r.item_id || '');
+                params.append(`row_service_${rid}`, r.service || '');
+                params.append(`row_fee_${rid}`, Math.round(parseFloat(r.fee || 0)));
+                params.append(`row_notes_${rid}`, r.notes || '');
+                params.append(`row_bp_${rid}`, r.bp || 'individual');
+            });
+        }
+
+        // Out of Scope Items
+        params.append('oos_submitted', 'true');
+        if (draft.out_of_scope_items && typeof draft.out_of_scope_items === 'object') {
+            Object.entries(draft.out_of_scope_items).forEach(([k, v]) => {
+                params.append(k, v);
+            });
+        }
+
+        terminalLog.innerHTML += `\n[${completed + 1}/${targetKeys.length}] Processing QBO ID ${qboId} / Eng ${engId} (${isPaper ? 'PAPER' : 'E-SIGN'})... `;
+
+        try {
+            const res = await fetch(window.location.href, {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: params.toString()
+            });
+
+            if (res.ok) {
+                const data = await res.json();
+                if (data.status === 'success') {
+                    if (draft) {
+                        draft.is_locked = true;
+                        if (params.get('include_cover_letter') === 'true') {
+                            draft.questionnaire_status = 'delivered';
+                        }
+                    }
+                    terminalLog.innerHTML += `SUCCESS ✔ (Estimate #${data.estimate_id || 'OK'})`;
+                } else {
+                    terminalLog.innerHTML += `FAILED ❌ (${data.message || 'Pipeline failed'})`;
+                }
+            } else {
+                let errDetail = `HTTP ${res.status}`;
+                try {
+                    const errData = await res.json();
+                    if (errData.message) errDetail = errData.message;
+                } catch(e) {}
+                terminalLog.innerHTML += `FAILED ❌ (${errDetail})`;
+            }
+        } catch (err) {
+            terminalLog.innerHTML += `ERROR ❌ (${err.message})`;
+        }
+
+        completed++;
+        progressBar.style.width = `${(completed / targetKeys.length) * 100}%`;
+        terminalLog.scrollTop = terminalLog.scrollHeight;
+    }
+
+    terminalLog.innerHTML += `\n\n========================================\nBatch pipeline execution complete!`;
+    closeBtn.style.display = 'inline-block';
+    renderBatchTableGrid();
+}

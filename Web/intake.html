@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Client Intake & Profile Hub</title>
+    <link rel="stylesheet" href="/css/intake.css?v=2.1">
+</head>
+<body>
+
+<div class="wrapper">
+    <div class="header-title-bar">
+        <h1>Client Intake & Profile Hub <span id="sandbox"></span></h1>
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <a href="/cgi/consent_pipeline.cgi" class="btn-app-switch" id="consent-pipeline">🔒 Consent Portal &rarr;</a>
+            <a href="/cgi/engagement_pipeline.cgi" class="btn-app-switch" id="engagement-pipeline">📑 Engagement Portal &rarr;</a>
+        </div>
+    </div>
+
+    <!-- Mode Switcher Controls -->
+    <div class="mode-switcher">
+        <button type="button" id="btn-mode-lead" class="mode-btn active" data-mode="lead" onclick="setMode('lead')">
+            ✨ Provision New Client Lead
+        </button>
+        <button type="button" id="btn-mode-heal" class="mode-btn" data-mode="heal" onclick="setMode('heal')">
+            🔵 Update Existing QBO Client
+        </button>
+        <button type="button" id="btn-mode-deactivate" class="mode-btn" data-mode="deactivate" onclick="setMode('deactivate')">
+            🚫 Deactivate Client
+        </button>
+    </div>
+
+    <!-- Main Intake Form -->
+    <form id="intake-form" onsubmit="handleFormSubmit(event)">
+        
+        <!-- SECTION 1: CLIENT NAME / LOOKUP -->
+        <div class="form-section">
+            <div class="section-title-bar">
+                <span class="section-title">Client Name</span>
+            </div>
+            <div class="form-group">
+                <input 
+                    type="text" 
+                    id="client-select-input" 
+                    name="client_name" 
+                    placeholder="Enter new lead name..." 
+                    oninput="onClientSearchInput()" 
+                    autocomplete="off" 
+                    required
+                >
+                <label for="client-select-input">LEGAL / DISPLAY CLIENT NAME</label>
+                <datalist id="client-select-options"></datalist>
+            </div>
+        </div>
+
+        <!-- SECTION 2: CONTACT & ACCOUNT DEMOGRAPHICS -->
+        <div class="form-section">
+            <div class="section-title-bar">
+                <span class="section-title">👤 Contact & Account Demographics</span>
+                <span id="client-lead-badge" class="badge-status lead">New Client</span>
+            </div>
+
+            <!-- Row 1: Contact Name & Date -->
+            <div class="grid-2">
+                <div class="form-group">
+                    <input type="text" id="friendly_name" name="friendly_name" placeholder="Signature / Contact Name" required>
+                    <label for="friendly_name">SIGNATURE / CONTACT NAME</label>
+                </div>
+                <div class="form-group">
+                    <input type="date" id="contact_date" name="contact_date" required>
+                    <label for="contact_date">INITIAL CONTACT DATE</label>
+                </div>
+            </div>
+
+            <!-- Row 2: Email & Phone -->
+            <div class="grid-2">
+                <div class="form-group">
+                    <input type="email" id="primary_email" name="client_email" placeholder="client@example.com" required>
+                    <label for="primary_email">PRIMARY EMAIL ADDRESS</label>
+                </div>
+                <div class="form-group">
+                    <input type="tel" id="phone_number" name="client_phone" placeholder="(703) 555-1212">
+                    <label for="phone_number">PHONE NUMBER</label>
+                </div>
+            </div>
+
+            <!-- Row 3: Co-Signer / Spouse Details -->
+            <div class="grid-2">
+                <div class="form-group">
+                    <input type="text" id="co_signer_name" name="co_signer_name" placeholder="e.g., Jane Doe">
+                    <label for="co_signer_name">ADDITIONAL SIGNER NAME (SPOUSE / PARTNER)</label>
+                </div>
+                <div class="form-group">
+                    <input type="email" id="co_signer_email" name="co_signer_email" placeholder="spouse@example.com">
+                    <label for="co_signer_email">ADDITIONAL SIGNER EMAIL</label>
+                </div>
+            </div>
+
+            <!-- Row 4: Account Classification, Delivery Format & Responder -->
+            <div class="grid-3">
+                <div class="form-group">
+                    <select id="entity_type" name="entity_type" required>
+                        <option value="" disabled selected>Select Entity Type...</option>
+                        <option value="individual">Individual / Sole Proprietorship</option>
+                        <option value="sm_llc">Single-Member LLC</option>
+                        <option value="s_corp">S-Corporation</option>
+                        <option value="partnership">Partnership / Multi-Member LLC</option>
+                        <option value="c_corp">C-Corporation</option>
+                        <option value="non_profit">Non-Profit Organization</option>
+                        <option value="trust">Trust / Estate</option>
+                    </select>
+                    <label for="entity_type">ACCOUNT CLASSIFICATION</label>
+                </div>
+                <div class="form-group">
+                    <select id="delivery_format" name="delivery_format" required>
+                        <option value="electronic" selected>Electronic</option>
+                        <option value="paper">Paper</option>
+                    </select>
+                    <label for="delivery_format">DELIVERY FORMAT</label>
+                </div>
+                <div class="form-group">
+                    <input type="text" id="responder" name="responder" placeholder="e.g., Jane Smith" required>
+                    <label for="responder">INTAKE COMPLETED BY</label>
+                </div>
+            </div>
+        </div>
+
+        <!-- SECTION 3: BILLING ADDRESS -->
+        <div class="form-section">
+            <div class="section-title-bar">
+                <span class="section-title">📍 Billing Address</span>
+            </div>
+            <div class="grid-address">
+                <div class="form-group">
+                    <input type="text" id="street" name="street" placeholder="1234 Main St">
+                    <label for="street">STREET</label>
+                </div>
+                <div class="form-group">
+                    <input type="text" id="city" name="city" placeholder="City">
+                    <label for="city">CITY</label>
+                </div>
+                <div class="form-group">
+                    <input type="text" id="state" name="state" placeholder="TX" maxlength="2">
+                    <label for="state">STATE</label>
+                </div>
+                <div class="form-group">
+                    <input type="text" id="zip" name="zip" placeholder="22030">
+                    <label for="zip">ZIP CODE</label>
+                </div>
+            </div>
+        </div>
+
+        <!-- SECTION 4: GENERAL NOTES (Hidden in Heal and Deactivate Modes) -->
+        <div id="section-notes" class="form-section">
+            <div class="section-title-bar">
+                <span class="section-title">📝 Intake & Service Notes</span>
+            </div>
+            <div class="form-group">
+                <textarea id="notes" name="notes" placeholder="Enter engagement notes, scope details, or fee estimates..."></textarea>
+                <label for="notes">ENGAGEMENT NOTES / COMMENTS</label>
+            </div>
+        </div>
+
+        <!-- SUBMIT ACTION -->
+        <button type="submit" id="btn-submit" class="btn-submit">
+            ⚡ Provision New Client & Folders
+        </button>
+    </form>
+</div>
+
+<!-- SAFETY DEACTIVATION CONFIRMATION MODAL -->
+<div id="confirm-modal-overlay" class="hidden">
+    <div class="status-card">
+        <h2 style="color: #b91c1c; margin-top: 0;">⚠️ Confirm Client Deactivation</h2>
+        <p id="confirm-modal-text">Are you sure you want to deactivate this client in QBO and move their SharePoint folders to <strong>!Inactive Clients</strong>?</p>
+        <div style="display: flex; gap: 10px; margin-top: 20px;">
+            <button type="button" id="btn-confirm-cancel" class="btn-submit" style="background-color: #64748b;" onclick="cancelDeactivationPrompt()">
+                Cancel
+            </button>
+            <button type="button" id="btn-confirm-proceed" class="btn-submit deactivate-mode" onclick="executeDeactivationSubmit()">
+                Yes, Deactivate Client
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- STATUS / PROGRESS OVERLAY -->
+<div id="status-overlay">
+    <div class="status-card">
+        <div id="status-spinner" class="spinner"></div>
+        <h2 id="status-title">Processing Request...</h2>
+        <p id="status-text">Please wait while the server processes your request.</p>
+        <button type="button" id="btn-close-overlay" class="btn-submit" style="display: none; margin-top: 15px;">
+            Close
+        </button>
+    </div>
+</div>
+
+<script src="/js/intake.js?v=2.1"></script>
+</body>
+</html>

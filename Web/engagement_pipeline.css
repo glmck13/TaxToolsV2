@@ -1,0 +1,1478 @@
+/* ==========================================================================
+   GLOBAL STYLES & RESET
+   ========================================================================== */
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 0;
+    background: #f0f2f5;
+    color: #222;
+}
+
+/* ==========================================================================
+   INITIAL FORM SELECTION LAYOUT (PHASE 1)
+   ========================================================================== */
+.wrapper {
+    max-width: 1000px;
+    width: 100%;
+    background: #fff;
+    padding: 35px;
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    margin: 30px auto;
+    box-sizing: border-box;
+    border-top: 6px solid #0078d4;
+}
+
+h1 {
+    color: #0078d4;
+    font-size: 24px;
+} 
+
+.header-title-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 25px;
+    padding-bottom: 14px;
+    border-bottom: 2px solid #efefef;
+    gap: 15px;
+}
+
+.header-title-bar h1 {
+    font-size: 24px;
+    font-weight: 700;
+    color: #0078d4;
+    margin: 0;
+    padding: 0;
+    border: none;
+    letter-spacing: -0.3px;
+}
+
+.btn-app-switch {
+    font-size: 13px;
+    font-weight: 600;
+    color: #0078d4;
+    background-color: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    padding: 8px 14px;
+    border-radius: 6px;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: all 0.15s ease-in-out;
+}
+
+.btn-app-switch:hover {
+    background-color: #0078d4;
+    color: #ffffff;
+    border-color: #0078d4;
+    box-shadow: 0 2px 6px rgba(0, 120, 212, 0.25);
+}
+
+.meta-info {
+    font-size: 13px;
+    color: #666;
+    margin-bottom: 25px;
+}
+
+.form-group {
+    margin-bottom: 25px;
+}
+
+label {
+    font-weight: 600;
+    display: block;
+    margin-bottom: 8px;
+    font-size: 15px;
+}
+
+select {
+    width: 100%;
+    padding: 12px;
+    font-size: 14px;
+    border: 1px solid #ccd1d9;
+    border-radius: 4px;
+    background: #fff;
+    box-sizing: border-box;
+}
+
+/* ==========================================================================
+   ENGAGEMENT TITLE & PROFILE CONTAINERS (DYNAMIC INJECTION)
+   ========================================================================== */
+.engagement-title-card {
+    background: #f8fafc;
+    border: 1px solid #cbd5e0;
+    border-left: 4px solid #0078d4;
+    padding: 16px;
+    border-radius: 6px;
+    margin-bottom: 25px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+}
+
+/* ==========================================================================
+   REVIEW & APPROVAL STATUS CARD (OPTION B)
+   ========================================================================== */
+.approval-card {
+    padding: 8px 14px;
+    border-radius: 6px;
+    margin-bottom: 12px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    transition: all 0.2s ease-in-out;
+}
+
+.approval-card-unapproved {
+    background: #fefce8;
+    border: 1px solid #fef08a;
+    border-left: 5px solid #eab308;
+}
+
+.approval-card-approved {
+    background: #f0fff4;
+    border: 1px solid #c6f6d5;
+    border-left: 5px solid #16a34a;
+}
+
+.approval-flex-container {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 15px;
+}
+
+.approval-checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    font-weight: 700;
+    color: #1e293b;
+    cursor: pointer;
+    user-select: none;
+}
+
+.approval-checkbox-label input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+    accent-color: #16a34a;
+}
+
+.approval-inputs-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.reviewer-initials-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.reviewer-initials-group label {
+    font-size: 12px;
+    font-weight: 600;
+    color: #475569;
+    margin-bottom: 0;
+}
+
+.reviewer-initials-input {
+    width: 65px !important;
+    text-transform: uppercase;
+    font-weight: 700;
+    text-align: center;
+    letter-spacing: 1px;
+    padding: 6px 8px !important;
+    font-size: 13px !important;
+}
+
+.approval-meta-text {
+    font-size: 12px;
+    color: #64748b;
+    font-style: italic;
+}
+
+/* ==========================================================================
+   PROFILE CARD STYLES
+   ========================================================================== */
+.profile-card {
+    padding: 20px;
+    border-radius: 6px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+}
+
+.profile-card-incomplete {
+    background: #fffaf0;
+    border: 1px solid #fbd38d;
+}
+
+.profile-card-complete {
+    background: #f0fff4;
+    border: 1px solid #c6f6d5;
+}
+
+.profile-card-locked {
+    background: #f0f7ff;
+    border: 1px solid #90cdfe;
+}
+
+.profile-card-title {
+    font-size: 16px;
+    font-weight: bold;
+    margin-bottom: 12px;
+}
+
+/* Lock Status Alert Box */
+.lock-banner-card {
+    background: #fefce8;
+    border: 1px solid #fef08a;
+    border-left: 5px solid #eab308;
+    padding: 16px;
+    border-radius: 6px;
+    margin-bottom: 25px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.lock-banner-title {
+    font-size: 15px;
+    font-weight: bold;
+    color: #854d0e;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.lock-banner-text {
+    font-size: 13px;
+    color: #713f12;
+    margin: 0;
+    line-height: 1.4;
+}
+
+/* Force Engagement Title to span the entire top row */
+.engagement-title-group {
+    grid-column: 1 / -1;
+}
+
+/* Top Row: Primary Contact Info (4 Columns) */
+.profile-editable-grid-top {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 15px;
+}
+
+/* Middle Row: Street, City, State, Zip (4 Columns) */
+.profile-editable-grid-middle {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 15px;
+}
+
+/* Bottom Row: Additional Signer Name, Additional Signer Email, Account Classification (3 Columns) */
+.profile-editable-grid-bottom {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+}
+
+.form-field-group {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.field-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: #4a5568;
+    margin-bottom: 4px;
+}
+
+.profile-card input[type="text"],
+.profile-card input[type="email"],
+.profile-card input[type="tel"],
+.profile-card select {
+    padding: 8px 10px;
+    font-size: 13px;
+    border: 1px solid #cbd5e0;
+    border-radius: 4px;
+    background: #fff;
+    width: 100%;
+    box-sizing: border-box;
+    transition: border-color 0.15s ease-in-out;
+}
+
+.profile-card input[type="text"]:focus,
+.profile-card input[type="email"]:focus,
+.profile-card input[type="tel"]:focus,
+.profile-card select:focus {
+    border-color: #0078d4;
+    outline: none;
+    box-shadow: 0 0 4px rgba(0, 120, 212, 0.15);
+}
+
+.profile-card input:disabled,
+.profile-card select:disabled {
+    background-color: #f7fafc;
+    color: #718096;
+    cursor: not-allowed;
+    border-color: #e2e8f0;
+}
+
+/* Verified View 3-Column Bottom Grid (Billing Address | Signature Grid | Account Classification) */
+.verified-bottom-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+    border-top: 1px dashed #c6f6d5;
+    padding-top: 14px;
+}
+
+/* ==========================================================================
+   QBO SYNC TOOLBAR CONTAINER (OPTION A: FLAT NEUTRAL CARD STYLE)
+   ========================================================================== */
+.qbo-sync-toolbar {
+    background-color: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin-bottom: 20px;
+    transition: background-color 0.15s ease-in-out;
+}
+
+.qbo-sync-toolbar:hover {
+    background-color: #f1f5f9;
+}
+
+.qbo-sync-checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #334155;
+    cursor: pointer;
+    user-select: none;
+}
+
+.qbo-sync-checkbox-label input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+    accent-color: #0078d4;
+}
+
+/* ==========================================================================
+   DYNAMIC WORKSPACE ESTIMATES MATRIX
+   ========================================================================== */
+.service-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 25px;
+    margin-bottom: 20px;
+    table-layout: fixed;
+}
+
+.service-table th {
+    background: #f7fafc;
+    color: #4a5568;
+    font-weight: 600;
+    text-align: left;
+    padding: 12px;
+    font-size: 14px;
+    border-bottom: 2px solid #e2e8f0;
+}
+
+.service-table td {
+    padding: 12px;
+    border-bottom: 1px solid #e2e8f0;
+    vertical-align: top;
+}
+
+/* Explicit Column Width Allocations */
+.service-table th:nth-child(1),
+.service-table td:nth-child(1) {
+    width: 6%;
+    text-align: center;
+}
+
+.service-table th:nth-child(2),
+.service-table td:nth-child(2) {
+    width: 38%;
+}
+
+.service-table th:nth-child(3) {
+    width: 15%;
+    text-align: right;
+}
+
+.service-table td:nth-child(3) {
+    width: 15%;
+    text-align: right;
+}
+
+.service-table td:nth-child(3) > span {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+}
+
+.service-table th:nth-child(4),
+.service-table td:nth-child(4) {
+    width: 38%;
+}
+
+.service-table td:nth-child(2) select {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.service-table td:nth-child(3) input[type="number"] {
+    width: 100px;
+    box-sizing: border-box;
+    text-align: right;
+}
+
+/* Hide spinner arrows for number inputs in the service table */
+.service-table input[type="number"]::-webkit-outer-spin-button,
+.service-table input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.service-table input[type="number"] {
+    -moz-appearance: textfield;
+}
+
+.btn-remove-row {
+    background: #fff1f2;
+    color: #e11d48;
+    border: 1px solid #ffe4e6;
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+    font-size: 16px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+}
+
+.btn-remove-row:hover {
+    background: #ffe4e6;
+    color: #be123c;
+}
+
+/* Badges for Row Classification Alignment */
+.badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    white-space: nowrap;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    border-radius: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    box-sizing: border-box;
+}
+
+.badge-clickable {
+    cursor: pointer;
+    transition: transform 0.1s ease, filter 0.15s ease;
+    user-select: none;
+}
+
+.badge-clickable:hover {
+    filter: brightness(0.92);
+    transform: translateY(-1px);
+}
+
+.badge-clickable:active {
+    transform: translateY(0);
+}
+
+.badge-individual {
+    background: #ebf8ff;
+    color: #2b6cb0;
+}
+
+.badge-organization {
+    background: #faf5ff;
+    color: #553c9a;
+}
+
+.badge-new {
+    background: #f0fdf4;
+    color: #15803d;
+    border: 1px solid #bbf7d0;
+}
+
+/* Footer Financial Calculation Styles */
+.calc-val {
+    font-family: monospace;
+    font-size: 15px;
+    font-weight: bold;
+    text-align: right;
+    padding-right: 12px;
+}
+
+.calc-row-net {
+    background: #f7fafc;
+    font-size: 15px;
+    font-weight: bold;
+}
+
+.calc-row-balance {
+    background: #edf2f7;
+    font-size: 16px;
+    font-weight: bold;
+    border-bottom: 2px solid #cbd5e0;
+}
+
+/* ==========================================================================
+   INTERACTIVE ACTIONS & OUT-OF-SCOPE WORK AREA
+   ========================================================================== */
+.actions-container {
+    margin-bottom: 30px;
+}
+
+.btn-add-row {
+    background: #fff;
+    color: #4a5568;
+    border: 1px solid #cbd5e0;
+    padding: 10px 16px;
+    border-radius: 4px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.15s ease;
+}
+
+.btn-add-row:hover {
+    background: #f7fafc;
+    border-color: #a0aec0;
+    color: #2d3748;
+}
+
+.btn-action-copy-trigger {
+    background: #f0f7ff;
+    color: #0078d4;
+    border-color: #0078d4;
+}
+
+.btn-action-copy-trigger:hover {
+    background: #e0f2fe;
+    border-color: #0284c7;
+    color: #0369a1;
+}
+
+/* Segmented Control Pill Switch Layout */
+.segmented-control-container {
+    display: inline-flex;
+    align-items: center;
+    background: #edf2f7;
+    border: 1px solid #cbd5e0;
+    border-radius: 20px;
+    padding: 3px;
+    user-select: none;
+    height: 48px; /* Matches .btn-submit computed height */
+    box-sizing: border-box;
+    white-space: nowrap;
+}
+
+.segmented-btn {
+    background: transparent;
+    border: none;
+    padding: 0 18px; /* Vertical centering handled by flex container height */
+    font-size: 14px;
+    font-weight: 600;
+    color: #4a5568;
+    border-radius: 16px;
+    cursor: pointer;
+    transition: all 0.15s ease-in-out;
+    white-space: nowrap;
+    height: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.segmented-btn.active {
+    background: #0078d4;
+    color: #ffffff;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+}
+
+.submit-container-flex {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+}
+
+/* Inline Clone Control Toolbar Styling */
+.inline-copy-toolbar {
+    background: #f0f9ff;
+    border: 1px solid #bae6fd;
+    border-left: 4px solid #0078d4;
+    padding: 14px;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+
+.out-of-scope-editor-group {
+    margin-top: 30px;
+    border-top: 1px solid #e2e8f0;
+    padding-top: 25px;
+}
+
+.out-of-scope-checklist-item {
+    display: block;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: background 0.15s ease;
+}
+
+.out-of-scope-checklist-item:hover {
+    background: #f8fafc; 
+}
+
+.out-of-scope-checklist-item input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: #0078d4; 
+}
+
+/* Custom Out-of-Scope Inline Add Controls */
+.add-out-of-scope-row input[type="text"] {
+    transition: border-color 0.15s ease-in-out;
+}
+
+.add-out-of-scope-row input[type="text"]:focus {
+    border-color: #0078d4;
+    outline: none;
+    box-shadow: 0 0 4px rgba(0, 120, 212, 0.15);
+}
+
+.custom-out-of-scope-item {
+    background-color: #f0f7ff;
+    border-radius: 4px;
+}
+
+.custom-out-of-scope-item label span {
+    color: #0078d4;
+    font-weight: 500;
+}
+
+.btn-submit {
+    background: #0078d4;
+    color: #fff;
+    border: none;
+    padding: 14px 28px;
+    font-size: 15px;
+    font-weight: bold;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.2s ease;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.btn-submit:hover {
+    background: #106ebe;
+}
+
+/* ==========================================================================
+   SPLIT PREVIEW CONTAINER (PHASE 2 RENDERER)
+   ========================================================================== */
+.split-container {
+    display: flex;
+    height: 100vh;
+    width: 100vw;
+    overflow: hidden;
+}
+
+.editor-panel {
+    width: 420px;
+    min-width: 420px;
+    background: #fff;
+    border-right: 1px solid #e2e8f0;
+    box-shadow: 2px 0 10px rgba(0,0,0,0.03);
+    z-index: 10;
+    box-sizing: border-box;
+}
+
+/* Contained overrides to stop component overflow inside the narrow Sidebar */
+.editor-panel select,
+.editor-panel input,
+.editor-panel button {
+    max-width: 100%;
+    box-sizing: border-box;
+}
+
+.pdf-panel {
+    flex-grow: 1;
+    background: #525659;
+}
+
+.pdf-panel iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    display: block;
+}
+
+/* ==========================================================================
+   EMAIL COMPOSER ACCORDION (PHASE 2 EDITOR SIDEBAR)
+   ========================================================================== */
+.email-composer-container {
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+
+.email-composer-box {
+    margin-top: 12px;
+    padding: 15px;
+    background: #f8fafc;
+    border: 1px solid #cbd5e0;
+    border-radius: 6px;
+    box-sizing: border-box;
+}
+
+.email-recipient-badge {
+    font-size: 12px;
+    font-weight: 600;
+    color: #475569;
+    margin-bottom: 10px;
+    padding: 6px 10px;
+    background: #e2e8f0;
+    border-radius: 4px;
+}
+
+/* ==========================================================================
+   SUCCESS STATUS PANEL VIEW (PHASE 3)
+   ========================================================================== */
+.success-wrapper {
+    background: #fafafa;
+    padding: 40px;
+    min-height: 100vh;
+    box-sizing: border-box;
+}
+
+.success-card {
+    max-width: 650px;
+    background: #fff;
+    padding: 40px;
+    border-radius: 6px;
+    border: 1px solid #107c41;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+    text-align: center;
+    margin: 40px auto 0 auto;
+}
+
+.icon-circle {
+    width: 60px;
+    height: 60px;
+    background: #dff6dd;
+    color: #107c41;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 32px;
+    font-weight: bold;
+    margin: 0 auto 20px auto;
+}
+
+.success-card h2 {
+    color: #107c41;
+    margin-top: 0;
+    margin-bottom: 12px;
+}
+
+.success-card p {
+    color: #444;
+    font-size: 15px;
+    line-height: 1.5;
+    margin-bottom: 24px;
+}
+
+/* Unified Layout Row Metrics */
+.notes-cell textarea {
+    width: 100%;
+    height: 46px; 
+    font-family: inherit;
+    font-size: 13px;
+    padding: 6px;
+    box-sizing: border-box;
+    resize: vertical; 
+    line-height: 1.4;
+    transition: border-color 0.15s ease-in-out;
+}
+
+.notes-cell textarea:focus {
+    border-color: #0078d4;
+    outline: none;
+    box-shadow: 0 0 4px rgba(0, 120, 212, 0.15);
+}
+
+/* ==========================================================================
+   PHASE 2 EDITOR SIDEBAR BUTTON VARIATIONS
+   ========================================================================== */
+.btn-action-grey {
+    background: #f3f4f6;
+    color: #374151;
+    border: 1px solid #d1d5db;
+}
+.btn-action-grey:hover {
+    background: #e5e7eb;
+}
+
+.btn-action-yellow {
+    background: #fef9c3;
+    color: #854d0e;
+    border: 1px solid #fde047;
+}
+.btn-action-yellow:hover {
+    background: #fef08a;
+}
+
+.btn-action-purple {
+    background: #7c3aed;
+    color: #ffffff;
+    border: 1px solid #6d28d9;
+}
+.btn-action-purple:hover {
+    background: #6d28d9;
+}
+
+.btn-action-lightgreen {
+    background: #dcfce7;
+    color: #166534;
+    border: 1px solid #86efac;
+}
+.btn-action-lightgreen:hover {
+    background: #bbf7d0;
+}
+
+.btn-action-green {
+    background: #15803d;
+    color: #ffffff;
+    border: 1px solid #166534;
+}
+.btn-action-green:hover {
+    background: #166534;
+}
+
+/* ==========================================================================
+   MODE TAB SWITCHER & BATCH DASHBOARD STYLES
+   ========================================================================== */
+.mode-tabs {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 25px;
+    border-bottom: 2px solid #e2e8f0;
+    padding-bottom: 0;
+}
+
+.tab-btn {
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    color: #4a5568;
+    background: transparent;
+    border: none;
+    border-bottom: 3px solid transparent;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    margin-bottom: -2px;
+}
+
+.tab-btn:hover {
+    color: #0078d4;
+}
+
+.tab-btn.active {
+    color: #0078d4;
+    border-bottom-color: #0078d4;
+}
+
+.mode-tabs-hidden {
+    display: none !important;
+}
+
+/* SharePoint Style Badges */
+.badge-paper {
+    background: #fef08a;
+    color: #854d0e;
+    border: 1px solid #fde047;
+    white-space: nowrap;
+}
+
+.badge-electronic {
+    background: #dcfce7;
+    color: #166534;
+    border: 1px solid #86efac;
+    white-space: nowrap;
+}
+
+.badge-locked {
+    background: #e0f2fe;
+    color: #0369a1;
+    border: 1px solid #bae6fd;
+    white-space: nowrap;
+}
+
+.badge-warning {
+    background: #fff7ed;
+    color: #c2410c;
+    border: 1px solid #ffedd5;
+    white-space: nowrap;
+}
+
+.badge-needs-review {
+    background: #fef9c3;
+    color: #854d0e;
+    border: 1px solid #fde047;
+    white-space: nowrap;
+}
+
+.badge-approved {
+    background: #dcfce7;
+    color: #166534;
+    border: 1px solid #86efac;
+    white-space: nowrap;
+}
+
+.badge-info {
+    background: #e0f2fe;
+    color: #0369a1;
+    border: 1px solid #bae6fd;
+    white-space: nowrap;
+}
+
+/* Questionnaire Status Badges */
+.badge-quest-unsent {
+    background: #f1f5f9;
+    color: #64748b;
+    border: 1px solid #cbd5e1;
+    white-space: nowrap;
+}
+
+.badge-quest-delivered {
+    background: #e0f2fe;
+    color: #0369a1;
+    border: 1px solid #bae6fd;
+    white-space: nowrap;
+}
+
+.badge-quest-returned {
+    background: #dcfce7;
+    color: #166534;
+    border: 1px solid #86efac;
+    white-space: nowrap;
+}
+
+/* ==========================================================================
+   CONSOLIDATED SINGLE-ROW BATCH TOOLBAR STYLING
+   ========================================================================== */
+.batch-toolbar-container {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    gap: 12px;
+}
+
+.toolbar-group-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1 1 65%;
+    min-width: 0;
+}
+
+.toolbar-divider {
+    width: 1px;
+    height: 28px;
+    background-color: #cbd5e1;
+    flex-shrink: 0;
+}
+
+.toolbar-group-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    min-width: 0;
+    justify-content: flex-end;
+}
+
+.batch-search-input {
+    flex: 1 1 auto;
+    min-width: 160px;
+    padding: 8px 12px;
+    font-size: 13px;
+    border: 1px solid #cbd5e0;
+    border-radius: 4px;
+    background: #ffffff;
+    box-sizing: border-box;
+}
+
+.batch-search-input:focus {
+    border-color: #0078d4;
+    outline: none;
+    box-shadow: 0 0 4px rgba(0, 120, 212, 0.15);
+}
+
+.batch-filter-select {
+    flex: 0 1 180px;
+    padding: 8px 10px;
+    font-size: 13px;
+    border: 1px solid #cbd5e0;
+    border-radius: 4px;
+    background: #ffffff;
+    box-sizing: border-box;
+}
+
+.batch-action-select {
+    flex: 0 1 auto;
+    min-width: 150px;
+    padding: 8px 10px;
+    font-size: 13px;
+    border: 1px solid #cbd5e0;
+    border-radius: 4px;
+    background: #ffffff;
+    box-sizing: border-box;
+    font-weight: 500;
+}
+
+.btn-batch-apply {
+    background: #0078d4;
+    color: #ffffff;
+    border: 1px solid #0078d4;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 700;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s ease-in-out;
+    flex-shrink: 0;
+}
+
+.btn-batch-apply:hover:not(:disabled) {
+    background: #106ebe;
+    border-color: #106ebe;
+    box-shadow: 0 2px 4px rgba(0, 120, 212, 0.2);
+}
+
+.btn-batch-apply:disabled {
+    background: #e2e8f0;
+    color: #94a3b8;
+    border-color: #cbd5e1;
+    cursor: not-allowed;
+    box-shadow: none;
+}
+
+/* Modal Option Selection Dialog for Paper Signature / Consent */
+.modal-radio-group {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin: 20px 0;
+}
+
+.modal-radio-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    background: #f8fafc;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+.modal-radio-option:hover {
+    background: #f1f5f9;
+}
+
+.modal-radio-option input[type="radio"] {
+    margin-top: 3px;
+    accent-color: #0078d4;
+}
+
+.modal-radio-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.modal-radio-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #0f172a;
+}
+
+.modal-radio-desc {
+    font-size: 12px;
+    color: #64748b;
+}
+
+/* ==========================================================================
+   PAGINATION TOOLBAR STYLING
+   ========================================================================== */
+.pagination-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 12px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    margin-bottom: 12px;
+}
+
+.pagination-toolbar label {
+    white-space: nowrap;
+}
+
+.pagination-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.btn-page-nav {
+    padding: 4px 10px;
+    font-size: 12px;
+    height: 32px;
+    line-height: 1;
+}
+
+.btn-page-nav:hover:not(:disabled) {
+    background: #f1f5f9;
+    border-color: #94a3b8;
+    color: #0f172a;
+}
+
+.btn-page-nav:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    background-color: #f1f5f9;
+    border-color: #e2e8f0;
+    color: #94a3b8;
+}
+
+.page-size-selector {
+    width: auto !important;
+    padding: 4px 8px;
+    font-size: 13px;
+    height: 32px;
+}
+
+/* ==========================================================================
+   BATCH DASHBOARD TABLE STYLING
+   ========================================================================== */
+.batch-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 15px;
+    table-layout: auto;
+}
+
+.batch-table th {
+    background: #f8fafc;
+    color: #4a5568;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 12px;
+    font-size: 13px;
+    border-bottom: 2px solid #e2e8f0;
+    white-space: nowrap;
+}
+
+.batch-table th.sortable-th {
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.15s ease-in-out;
+}
+
+.batch-table th.sortable-th:hover {
+    background-color: #edf2f7;
+    color: #0078d4;
+}
+
+.sort-indicator {
+    font-size: 11px;
+    color: #94a3b8;
+    margin-left: 3px;
+}
+
+.batch-table th.sortable-th:hover .sort-indicator {
+    color: #0078d4;
+}
+
+/* Modal Overlay Styling */
+.modal-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+}
+
+.modal-content {
+    background: #fff;
+    width: 1180px;
+    max-width: 95vw;
+    max-height: 90vh;
+    overflow-y: auto;
+    border-radius: 6px;
+    padding: 30px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+    position: relative;
+    box-sizing: border-box;
+}
+
+#modal-workspace-container {
+    width: 100%;
+    overflow-x: auto;
+    padding-bottom: 10px;
+}
+
+.modal-close-btn {
+    position: absolute;
+    top: 15px;
+    right: 20px;
+    font-size: 24px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    color: #666;
+}
+
+.modal-close-btn:hover {
+    color: #000;
+}
+
+.progress-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.65);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+}
+
+.progress-card {
+    background: #fff;
+    width: 650px;
+    max-width: 90vw;
+    padding: 30px;
+    border-radius: 6px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+}
+
+.progress-bar-bg {
+    background: #e2e8f0;
+    height: 12px;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 15px;
+}
+
+.progress-bar-fill {
+    background: #0078d4;
+    width: 0%;
+    height: 100%;
+    transition: width 0.3s ease;
+}
+
+.terminal-log {
+    background: #1e1e1e;
+    color: #4af626;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 15px;
+    height: 220px;
+    overflow-y: auto;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    line-height: 1.4;
+}
+
+.profile-card input.read-only-input {
+    background-color: #f1f5f9 !important;
+    color: #475569 !important;
+    border: 1px solid #cbd5e0 !important;
+    cursor: default !important;
+    box-shadow: none !important;
+}
+
+.profile-card input.read-only-input:focus {
+    border-color: #cbd5e0 !important;
+    outline: none !important;
+    box-shadow: none !important;
+}
+
+/* Tighten table padding overall */
+.batch-table th,
+.batch-table td {
+    vertical-align: middle;
+    padding: 4px 6px !important;
+}
+
+/* Column 1: Row Checkbox Column */
+.batch-table th:nth-child(1),
+.batch-table td:nth-child(1) {
+    width: 32px !important;
+    text-align: center;
+}
+
+/* Column 2: QBO ID Column */
+.batch-table th:nth-child(2),
+.batch-table td:nth-child(2) {
+    width: 65px !important;
+    white-space: nowrap;
+}
+
+/* Column 3: Client / Engagement Column */
+.batch-table th:nth-child(3),
+.batch-table td:nth-child(3) {
+    max-width: 220px !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Column 4: Class Column */
+.batch-table th:nth-child(4),
+.batch-table td:nth-child(4) {
+    width: 85px !important;
+}
+
+/* Column 5: Total Fee Column */
+.batch-table th:nth-child(5),
+.batch-table td:nth-child(5) {
+    width: 90px !important;
+    text-align: right;
+}
+
+/* Column 6: Questionnaire Status Column */
+.batch-table th:nth-child(6),
+.batch-table td:nth-child(6) {
+    width: 110px !important;
+    white-space: nowrap;
+}
+
+/* Column 7: Format Column */
+.batch-table th:nth-child(7),
+.batch-table td:nth-child(7) {
+    width: 100px !important;
+    white-space: nowrap;
+}
+
+/* Column 8: Status Column */
+.batch-table th:nth-child(8),
+.batch-table td:nth-child(8) {
+    width: 150px !important;
+    white-space: nowrap;
+}
+
+/* ==========================================================================
+   APPROVAL CARD VISIBILITY OVERRIDES
+   ========================================================================== */
+
+/* Hide approval status card in the main single-client workspace view */
+#single-approval-card-container {
+    display: none !important;
+}
+
+/* Ensure approval status card remains visible inside the batch quick-review modal */
+#modal-workspace-container #approval-card-container {
+    display: block !important;
+}
+
+.btn-delete-draft {
+    background: #fee2e2;
+    color: #dc2626;
+    border-color: #fca5a5;
+    margin-left: auto;
+}
+
+.btn-delete-draft:hover {
+    background: #fca5a5;
+    color: #7f1d1d;
+}
+
+/* ==========================================================================
+   PORTAL CROSS-NAVIGATION STYLES
+   ========================================================================== */
+.portal-nav-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 25px;
+    padding-bottom: 12px;
+    border-bottom: 2px solid #efefef;
+    gap: 15px;
+}
+
+.portal-nav-links {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.btn-portal-nav {
+    font-size: 13px;
+    font-weight: 600;
+    color: #0078d4;
+    background-color: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    padding: 8px 14px;
+    border-radius: 6px;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: all 0.15s ease-in-out;
+}
+
+.btn-portal-nav:hover {
+    background-color: #0078d4;
+    color: #ffffff;
+    border-color: #0078d4;
+    box-shadow: 0 2px 6px rgba(0, 120, 212, 0.25);
+}
