@@ -13,7 +13,8 @@ ENTITY_KEYWORDS = re.compile(
     r"\b(?:LLC|Inc|Corp|LLP|PLLC|Ltd|Limited|PC|PA|Trust|Estate|Tr|Foundation|"
     r"Associates|Advisors|Partners|Partnership|Holdings|Group|Enterprises|Services|"
     r"Consulting|Ventures|Properties|Management|Realty|Rentals|Shop|Farm|Company|"
-    r"Declaration|Systems|Therapy|Law|Trustar|VBAD)\b",
+    r"Declaration|Systems|Therapy|Law|Trustar|VBAD|Advocacy|Clinic|Studio|Spa|"
+    r"Solutions|Technologies|Energy|Development|Utilities|Investments)\b",
     re.IGNORECASE,
 )
 
