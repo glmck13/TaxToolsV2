@@ -17,7 +17,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (isSandbox) {
         const sandboxEl = document.getElementById("sandbox");
         if (sandboxEl) {
-            sandboxEl.innerHTML = ' <span style="color: orange;">***SANDBOX***</span>';
+            sandboxEl.innerHTML = ' <span class="sandbox-badge">***SANDBOX***</span>';
         }
 
         const engagementLink = document.getElementById("engagement-pipeline");
@@ -30,13 +30,8 @@ document.addEventListener("DOMContentLoaded", () => {
             consentLink.href = "/cgi/consent_sandbox.cgi";
         }
     }
-    // Set default contact date to today
-    const contactDateInput = document.getElementById("contact_date");
-    if (contactDateInput && !contactDateInput.value) {
-        contactDateInput.value = new Date().toISOString().split("T")[0];
-    }
 
-    // Initialize mode setup
+    // Initialize mode setup (also sets today's default contact_date)
     setMode("lead");
 
     // Fetch existing QBO customers on load
@@ -44,13 +39,13 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 /**
- * Fetch QBO customer catalog from intake_lookup.py via CGI
+ * Fetch QBO customer catalog from intake_lookup.cgi
  */
 async function loadCustomerCatalog() {
     try {
         const response = await fetch(LOOKUP_CGI_URL, { method: "GET" });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        
+
         const data = await response.json();
         if (data.status === "success" && data.customers) {
             customerCatalog = data.customers;
@@ -69,7 +64,7 @@ async function loadCustomerCatalog() {
 function populateDatalist() {
     const datalist = document.getElementById("client-select-options");
     if (!datalist) return;
-    
+
     datalist.innerHTML = "";
     Object.keys(customerCatalog).sort().forEach(catalogKey => {
         const option = document.createElement("option");
@@ -91,16 +86,11 @@ function setFieldsReadOnly(isReadOnly) {
     inputIds.forEach(id => {
         const el = document.getElementById(id);
         if (el) {
-            if (isReadOnly) {
-                el.setAttribute("readonly", "readonly");
-            } else {
-                el.removeAttribute("readonly");
-            }
+            el.readOnly = isReadOnly;
         }
     });
 
-    const selectIds = ["entity_type", "delivery_format"];
-    selectIds.forEach(id => {
+    ["entity_type", "delivery_format"].forEach(id => {
         const el = document.getElementById(id);
         if (el) {
             el.disabled = isReadOnly;
@@ -110,10 +100,12 @@ function setFieldsReadOnly(isReadOnly) {
 
 /**
  * Switch mode between "lead" (New Lead), "heal" (Existing Client), and "deactivate" (Archive Client)
+ * @param {string} mode - Target mode ("lead", "heal", "deactivate")
+ * @param {boolean} preserveData - If true, keeps existing form values intact (used when cloning a client)
  */
-function setMode(mode) {
+function setMode(mode, preserveData = false) {
     currentMode = mode;
-    
+
     const btnLead = document.getElementById("btn-mode-lead");
     const btnHeal = document.getElementById("btn-mode-heal");
     const btnDeactivate = document.getElementById("btn-mode-deactivate");
@@ -124,29 +116,24 @@ function setMode(mode) {
     const badge = document.getElementById("client-lead-badge");
     const formEl = document.getElementById("intake-form");
 
-    // 1. Reset form fields to clean state on mode switch
-    if (formEl) {
-        formEl.reset();
+    // 1. Reset form fields unless preserving cloned data
+    if (!preserveData) {
+        if (formEl) formEl.reset();
+        clearClientFields();
+
+        const contactDateInput = document.getElementById("contact_date");
+        if (contactDateInput) {
+            contactDateInput.value = new Date().toISOString().split("T")[0];
+        }
     }
-    clearClientFields();
 
-    // Re-apply today's date following form reset
-    const contactDateInput = document.getElementById("contact_date");
-    if (contactDateInput) {
-        contactDateInput.value = new Date().toISOString().split("T")[0];
-    }
+    // Reset tab button active states & section classes
+    [btnLead, btnHeal, btnDeactivate].forEach(btn => btn && btn.classList.remove("active"));
+    formSections.forEach(section => section.classList.remove("heal-mode", "deactivate-mode"));
 
-    // Reset button active tab states
-    if (btnLead) btnLead.classList.remove("active");
-    if (btnHeal) btnHeal.classList.remove("active");
-    if (btnDeactivate) btnDeactivate.classList.remove("active");
+    if (submitBtn) submitBtn.disabled = false;
 
-    // Reset section accent classes
-    formSections.forEach(section => {
-        section.classList.remove("heal-mode", "deactivate-mode");
-    });
-
-    // 2. Adjust tab-specific styling & properties
+    // 2. Apply mode-specific UI & input rules
     if (mode === "deactivate") {
         if (btnDeactivate) btnDeactivate.classList.add("active");
         if (notesSection) notesSection.classList.add("hidden");
@@ -158,12 +145,11 @@ function setMode(mode) {
             badge.textContent = "Deactivate Client";
             badge.className = "badge-status deactivate";
         }
-
         if (submitBtn) {
             submitBtn.className = "btn-submit deactivate-mode";
             submitBtn.innerHTML = "🚫 Deactivate Client & Archive Folders";
+            submitBtn.disabled = true; // Require valid catalog selection before deactivating
         }
-
         if (clientInput) {
             clientInput.setAttribute("list", "client-select-options");
             clientInput.placeholder = "Select client to deactivate...";
@@ -180,12 +166,10 @@ function setMode(mode) {
             badge.textContent = "Existing Client";
             badge.className = "badge-status heal";
         }
-
         if (submitBtn) {
             submitBtn.className = "btn-submit heal-mode";
             submitBtn.innerHTML = "💾 Update QBO Record";
         }
-
         if (clientInput) {
             clientInput.setAttribute("list", "client-select-options");
             clientInput.placeholder = "Select or search QBO client...";
@@ -201,12 +185,10 @@ function setMode(mode) {
             badge.textContent = "New Client";
             badge.className = "badge-status lead";
         }
-
         if (submitBtn) {
             submitBtn.className = "btn-submit";
             submitBtn.innerHTML = "⚡ Provision New Client & Folders";
         }
-
         if (clientInput) {
             clientInput.removeAttribute("list");
             clientInput.placeholder = "Enter new lead name...";
@@ -223,29 +205,46 @@ function onClientSearchInput() {
 
     const inputVal = inputEl.value.trim();
     const qboIdInput = document.getElementById("qbo_id");
-    
-    // 1. If user selected a full datalist option like "Sper, Karyn (ID: 55)"
+    const submitBtn = document.getElementById("btn-submit");
+
+    // 1. Exact match selected from datalist (e.g., "Sper, Karyn (ID: 55)")
     if (customerCatalog[inputVal]) {
         if (currentMode === "lead") {
             setMode("heal");
         }
         fillClientFields(customerCatalog[inputVal], inputVal);
-        return;
-    } 
-
-    // 2. If the user completely cleared the input box, reset all client fields
-    if (inputVal === "") {
-        clearClientFields();
+        if (currentMode === "deactivate" && submitBtn) {
+            submitBtn.disabled = false;
+        }
         return;
     }
 
-    // 3. EDITING / TYPO CORRECTION:
-    // Keep qbo_id attached as long as (ID: XX) matching the ID remains in the box
-    if (qboIdInput && qboIdInput.value) {
+    // 2. Deactivate mode requires an exact catalog match
+    if (currentMode === "deactivate") {
+        if (inputVal === "") {
+            clearClientFields();
+        } else if (qboIdInput) {
+            qboIdInput.value = "";
+        }
+        if (submitBtn) submitBtn.disabled = true;
+        return;
+    }
+
+    // 3. Cloning trigger in "heal" mode:
+    // If (ID: XX) was removed or the input was cleared (e.g. Ctrl+A -> Backspace),
+    // detach qbo_id and switch to "lead" mode while preserving cloned fields.
+    if (currentMode === "heal" && qboIdInput && qboIdInput.value) {
         const idPattern = new RegExp(`\\(ID:\\s*${qboIdInput.value}\\)`, "i");
         if (!idPattern.test(inputVal)) {
-            qboIdInput.value = ""; // Detach only if (ID: XX) was deleted or altered
+            qboIdInput.value = "";
+            setMode("lead", true);
         }
+        return;
+    }
+
+    // 4. Input completely cleared outside of a clone action
+    if (inputVal === "") {
+        clearClientFields();
     }
 }
 
@@ -258,7 +257,7 @@ function fillClientFields(clientData, catalogKey = "") {
     const meta = clientData.metadata || {};
     const addr = clientData.address || {};
 
-    let formEl = document.getElementById("intake-form");
+    const formEl = document.getElementById("intake-form");
     let qboIdInput = document.getElementById("qbo_id");
     if (!qboIdInput) {
         qboIdInput = document.createElement("input");
@@ -267,9 +266,8 @@ function fillClientFields(clientData, catalogKey = "") {
         qboIdInput.name = "qbo_id";
         if (formEl) formEl.appendChild(qboIdInput);
     }
-    
+
     qboIdInput.value = clientData.id || "";
-    qboIdInput.dataset.cleanName = clientData.display_name || "";
 
     const clientInput = document.getElementById("client-select-input");
     if (clientInput) {
@@ -303,7 +301,6 @@ function clearClientFields() {
     const qboIdInput = document.getElementById("qbo_id");
     if (qboIdInput) {
         qboIdInput.value = "";
-        qboIdInput.dataset.cleanName = "";
     }
 
     const setVal = (id, val = "") => {
@@ -359,12 +356,11 @@ function executeDeactivationSubmit() {
 function handleFormSubmit(event) {
     event.preventDefault();
 
-    // If in deactivate mode, prompt user for confirmation first
     if (currentMode === "deactivate") {
         const clientInput = document.getElementById("client-select-input");
         const clientName = clientInput ? clientInput.value : "this client";
         const confirmTextEl = document.getElementById("confirm-modal-text");
-        
+
         if (confirmTextEl) {
             confirmTextEl.innerHTML = `Are you sure you want to set <strong>${clientName}</strong> to inactive in QBO and move their folders to <strong>!Inactive Clients</strong>?`;
         }
@@ -395,6 +391,7 @@ async function sendIntakeFormRequest() {
     const isNewLead = (currentMode === "lead");
 
     if (statusTitle) {
+        statusTitle.className = "";
         if (isDeactivate) {
             statusTitle.textContent = "Deactivating Client & Archiving Folders...";
         } else if (isNewLead) {
@@ -418,40 +415,25 @@ async function sendIntakeFormRequest() {
     const formData = new FormData(formEl);
     const payload = {};
 
-    for (let [key, value] of formData.entries()) {
-        let cleanVal = value;
-        
-        // Strip "(ID: 123)" if present in client_name
-        if (key === "client_name") {
-            cleanVal = value.replace(/\s*\(\s*ID:\s*\d+\s*\)/gi, "").trim();
-        }
-        
-        payload[key] = cleanVal;
+    for (const [key, value] of formData.entries()) {
+        payload[key] = (key === "client_name")
+            ? value.replace(/\s*\(\s*ID:\s*\d+\s*\)/gi, "").trim()
+            : value;
     }
 
-    // Capture values from disabled/readonly inputs ignored by FormData
-    const getVal = (id) => {
-        const el = document.getElementById(id);
-        return el ? el.value : "";
-    };
-
+    // Capture disabled <select> values omitted by FormData in deactivate mode
+    const getVal = (id) => document.getElementById(id)?.value || "";
     payload["entity_type"] = payload["entity_type"] || getVal("entity_type");
     payload["delivery_format"] = payload["delivery_format"] || getVal("delivery_format");
-    payload["friendly_name"] = payload["friendly_name"] || getVal("friendly_name");
-    payload["client_email"] = payload["client_email"] || getVal("primary_email");
-    payload["client_phone"] = payload["client_phone"] || getVal("phone_number");
-    payload["responder"] = payload["responder"] || getVal("responder");
 
-    // Explicit Action Parameter
+    // Explicit action parameters
     payload["action"] = currentMode; // "lead", "heal", or "deactivate"
     payload["is_new_lead"] = isNewLead ? "true" : "false";
 
     try {
         const response = await fetch(PROVISION_CGI_URL, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
         });
 
@@ -463,20 +445,20 @@ async function sendIntakeFormRequest() {
             if (statusSpinner) statusSpinner.style.display = "none";
             if (statusTitle) {
                 if (isDeactivate) {
-                    statusTitle.style.color = "#b91c1c";
+                    statusTitle.className = "success-deactivate";
                     statusTitle.textContent = "🚫 Client Deactivated & Archived Successfully!";
                 } else if (isNewLead) {
-                    statusTitle.style.color = "#15803d";
+                    statusTitle.className = "success-lead";
                     statusTitle.textContent = "✨ New Client Provisioned!";
                 } else {
-                    statusTitle.style.color = "#0369a1";
+                    statusTitle.className = "success-heal";
                     statusTitle.textContent = "🟢 Profile Updated Successfully!";
                 }
             }
             if (statusText) {
                 statusText.textContent = result.message || "Operation completed successfully.";
             }
-            
+
             if (btnClose) {
                 btnClose.textContent = "Done & Reset Form";
                 btnClose.className = isDeactivate ? "btn-submit deactivate-mode" : "btn-submit";
@@ -489,13 +471,13 @@ async function sendIntakeFormRequest() {
     } catch (err) {
         if (statusSpinner) statusSpinner.style.display = "none";
         if (statusTitle) {
-            statusTitle.style.color = "#d9381e";
+            statusTitle.className = "error";
             statusTitle.textContent = "❌ Process Failed";
         }
         if (statusText) {
             statusText.textContent = err.message || "Could not complete the intake request. Please check the server logs.";
         }
-        
+
         if (btnClose) {
             btnClose.textContent = "Close & Keep Editing";
             btnClose.className = "btn-submit heal-mode";
