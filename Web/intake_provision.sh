@@ -364,12 +364,12 @@ QBO_PATCH_PAYLOAD=$(jq -n \
     sparse: true,
     DisplayName: $display_name,
     CompanyName: $company_name,
-    PrimaryEmailAddr: { Address: $email },
-    PrimaryPhone: { FreeFormNumber: $phone },
-    Notes: $notes,
-    BillAddr: { Line1: $street, City: $city, CountrySubDivisionCode: $state, PostalCode: $zip }
+    Notes: $notes
   } 
-  + (if $id != "" then {Id: $id, SyncToken: $sync_token} else {} end)')
+  + (if $id != "" then {Id: $id, SyncToken: $sync_token} else {} end)
+  + (if $email != "" then {PrimaryEmailAddr: { Address: $email }} else {} end)
+  + (if $phone != "" then {PrimaryPhone: { FreeFormNumber: $phone }} else {} end)
+  + (if ($street != "" or $city != "" or $state != "" or $zip != "") then {BillAddr: { Line1: $street, City: $city, CountrySubDivisionCode: $state, PostalCode: $zip }} else {} end)')
 
 QBO_POST_URI="/company/${QBO_REALMID}/customer"
 debug "Posting Customer Payload to QBO (Sparse Update Enabled)..."
@@ -378,7 +378,12 @@ QBO_RESPONSE=$(echo "$QBO_PATCH_PAYLOAD" | qbo.sh POST "$QBO_POST_URI" 2>&1 || e
 QBO_CUSTOMER_ID=$(echo "$QBO_RESPONSE" | jq -r '.Customer.Id // empty' 2>/dev/null)
 
 if [ -z "$QBO_CUSTOMER_ID" ]; then
-    QBO_CUSTOMER_ID="${EXISTING_ID:-Unknown}"
+    FAULT_MSG=$(echo "$QBO_RESPONSE" | jq -r 'if .Fault.Error[0] then "\(.Fault.Error[0].Message // "QBO Error"): \(.Fault.Error[0].Detail // "")" else empty end' 2>/dev/null || echo "")
+    FAULT_MSG="${FAULT_MSG:-${QBO_RESPONSE:0:200}}"
+    FAULT_MSG="${FAULT_MSG:-Invalid response from QBO}"
+    debug "ERROR: QBO Customer POST failed: $FAULT_MSG"
+    jq -n --arg msg "QuickBooks Online sync failed: $FAULT_MSG" '{status: "error", message: $msg}'
+    exit 1
 fi
 
 debug "QBO Sync complete. Resolved Numeric QBO ID: $QBO_CUSTOMER_ID"
