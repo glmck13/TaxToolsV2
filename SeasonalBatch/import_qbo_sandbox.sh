@@ -2,7 +2,7 @@
 set -e
 
 # Force Sandbox environment to resolve sandbox-qboTokens.conf
-export QBO_SANDBOX="sandbox-"
+export QBO_SANDBOX="dryrun-"
 
 EXPORT_DIR="./qbo_export"
 MAPPING_FILE="$EXPORT_DIR/id_mapping.json"

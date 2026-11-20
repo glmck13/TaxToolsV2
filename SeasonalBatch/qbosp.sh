@@ -20,4 +20,5 @@ export AUTH_TOKEN=$(m365 util accesstoken get --resource "$TENANT_URL" --output 
 source /var/www/webenv/bin/activate
 
 export GEMINI_API_KEY=""
-qbosp.py
+
+exec "${0%.*}.py" "$@"

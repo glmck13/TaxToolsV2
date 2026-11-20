@@ -9,4 +9,4 @@ qboRefresh.sh >/dev/null
 
 source /var/www/webenv/bin/activate
 
-qbota.py $*
+exec "${0%.*}.py" "$@"
