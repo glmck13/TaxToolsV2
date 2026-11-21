@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import html
+import time
 import re
 import io
 import urllib.parse
@@ -174,15 +175,18 @@ def adobe_sign_api_request(endpoint, method="POST", payload=None, files=None):
         print(f"Adobe Sign HTTP Error [{e.code}]: {error_body}", file=sys.stderr)
         raise Exception(f"Adobe Sign Call Failed: {error_body}")
 
-def submit_adobe_sign_transaction(client_qbo_id, pdf_binary_data, additional_signer_email=None, primary_name_override=None, co_signer_name=None):
+def submit_adobe_sign_transaction(client_qbo_id, pdf_binary_data, additional_signer_email=None, primary_name_override=None, co_signer_name=None, primary_email_override=None):
     """Handles envelope transmission and routing parameters for Adobe Sign."""
     try:
-        fresh_customer = qbo_api_request(f"customer/{client_qbo_id}").get("Customer", {})
-        raw_email = fresh_customer.get("PrimaryEmailAddr", {}).get("Address", "")
-        primary_email = raw_email.split(",")[0].strip() if raw_email else ""
+        if primary_email_override and "@" in primary_email_override:
+            primary_email = primary_email_override.strip()
+        else:
+            fresh_customer = qbo_api_request(f"customer/{client_qbo_id}").get("Customer", {})
+            raw_email = fresh_customer.get("PrimaryEmailAddr", {}).get("Address", "")
+            primary_email = raw_email.split(",")[0].strip() if raw_email else ""
 
         if not primary_email:
-            return False, "Customer record is missing a valid Primary Email Address in QBO."
+            return False, "Customer record is missing a valid Target Email Address."
 
         files_payload = (f"Section_7216_Consent_{client_qbo_id}.pdf", "application/pdf", pdf_binary_data)
         transient_res = adobe_sign_api_request("transientDocuments", method="POST", files=files_payload)
@@ -204,7 +208,7 @@ def submit_adobe_sign_transaction(client_qbo_id, pdf_binary_data, additional_sig
 
             participant_sets.append({
                 "memberInfos": [co_signer_member],
-                "order": 2,
+                "order": 1,
                 "role": "SIGNER"
             })
 
@@ -280,11 +284,11 @@ def render_phase1_workspace(error_msg=None, preserved_form=None):
         addr_obj = c.get("BillAddr", {})
         c_email = c.get("PrimaryEmailAddr", {}).get("Address", "")
         
-        # Extract phone number from QBO customer record[cite: 3]
+        # Extract phone number from QBO customer record
         phone_obj = c.get("PrimaryPhone", {})
         c_phone = phone_obj.get("FreeFormNumber", "") if isinstance(phone_obj, dict) else ""
 
-        # Parse QBO Notes JSON metadata using parse_acct_num()[cite: 3]
+        # Parse QBO Notes JSON metadata using parse_acct_num()
         meta = parse_acct_num(acct_num)
         meta["legal_name"] = c_name
         if not meta.get("friendly_name"):
@@ -309,14 +313,20 @@ def render_phase1_workspace(error_msg=None, preserved_form=None):
         }
 
     selected_client = ""
+    tax_years_val = ""
+    client_advisor_val = ""
     preserved_heal_data_json = "{}"
 
     if preserved_form:
         selected_client = html.unescape(get_form_val(preserved_form, "client_name"))
+        tax_years_val = html.unescape(get_form_val(preserved_form, "tax_years_covered"))
+        client_advisor_val = html.unescape(get_form_val(preserved_form, "client_advisor"))
         heal_data = {
             "friendly_name": html.unescape(get_form_val(preserved_form, "friendly_name")),
             "local_legal_name": html.unescape(get_form_val(preserved_form, "local_legal_name")),
-            "tax_years_covered": get_form_val(preserved_form, "tax_years_covered", "2025 and 2026 tax years"),
+            "target_email": get_form_val(preserved_form, "target_email").strip(),
+            "tax_years_covered": tax_years_val,
+            "client_advisor": client_advisor_val,
             "client_phone_num": get_form_val(preserved_form, "client_phone_num"),
             "local_street": get_form_val(preserved_form, "local_street"),
             "local_city": get_form_val(preserved_form, "local_city"),
@@ -362,13 +372,15 @@ def render_phase1_workspace(error_msg=None, preserved_form=None):
     <form method="POST" action="{SCRIPT_URL}">
         {f'<div style="background:#fde8e8; border:1px solid #e53e3e; color:#9b2c2c; padding:15px; margin-bottom:20px; border-radius:4px;">{html.escape(error_msg)}</div>' if error_msg else ''}
 
-        <div class="form-group">
-            <label for="tax-years-covered">Tax Years Covered by Consent:</label>
-            <select name="tax_years_covered" id="tax-years-covered">
-                <option value="2025 and 2026 tax years">2025 and 2026 tax years</option>
-                <option value="2026 tax year">2026 tax year</option>
-                <option value="2025 tax year">2025 tax year</option>
-            </select>
+        <div class="form-row-split">
+            <div>
+                <label for="tax-years-covered">Tax Years Covered by Consent:</label>
+                <input type="text" name="tax_years_covered" id="tax-years-covered" value="{html.escape(tax_years_val)}" placeholder="e.g., 2025 and 2026 tax years" required>
+            </div>
+            <div>
+                <label for="client-advisor">Client Advisor:</label>
+                <input type="text" name="client_advisor" id="client-advisor" value="{html.escape(client_advisor_val)}" placeholder="e.g., Rembert Pendleton Jackson" required>
+            </div>
         </div>
 
         <div class="form-group">
@@ -407,7 +419,9 @@ def handle_generate_preview(form):
 
     friendly_name = html.unescape(get_form_val(form, "friendly_name")).strip() or clean_client_title
     local_legal_name = html.unescape(get_form_val(form, "local_legal_name")).strip() or clean_client_title
-    tax_years_covered = get_form_val(form, "tax_years_covered", "2025 and 2026 tax years")
+    target_email = get_form_val(form, "target_email").strip()
+    tax_years_covered = html.unescape(get_form_val(form, "tax_years_covered")).strip()
+    client_advisor = html.unescape(get_form_val(form, "client_advisor")).strip()
     client_phone_num = get_form_val(form, "client_phone_num") # Captured from form
 
     local_street = get_form_val(form, "local_street")
@@ -425,7 +439,9 @@ def handle_generate_preview(form):
         ("client_name", client_name),
         ("friendly_name", friendly_name),
         ("local_legal_name", local_legal_name),
+        ("target_email", target_email),
         ("tax_years_covered", tax_years_covered),
+        ("client_advisor", client_advisor),
         ("client_phone_num", client_phone_num), # Passed to PDF preview
         ("local_street", local_street),
         ("local_city", local_city),
@@ -452,7 +468,9 @@ def handle_generate_preview(form):
             <input type="hidden" name="client_name" value="{html.escape(client_name)}">
             <input type="hidden" name="friendly_name" value="{html.escape(friendly_name)}">
             <input type="hidden" name="local_legal_name" value="{html.escape(local_legal_name)}">
+            <input type="hidden" name="target_email" value="{html.escape(target_email)}">
             <input type="hidden" name="tax_years_covered" value="{html.escape(tax_years_covered)}">
+            <input type="hidden" name="client_advisor" value="{html.escape(client_advisor)}">
             <input type="hidden" name="client_phone_num" value="{html.escape(client_phone_num)}">
             <input type="hidden" name="local_street" value="{html.escape(local_street)}">
             <input type="hidden" name="local_city" value="{html.escape(local_city)}">
@@ -533,7 +551,8 @@ def compile_reportlab_pdf_buffer(form, include_esign_tags=False):
 
     friendly_name = html.unescape(get_form_val(form, "friendly_name")).strip() or clean_client_title
     local_legal_name = html.unescape(get_form_val(form, "local_legal_name")).strip() or clean_client_title
-    tax_years_covered = get_form_val(form, "tax_years_covered", "2025 and 2026 tax years")
+    tax_years_covered = html.unescape(get_form_val(form, "tax_years_covered")).strip()
+    client_advisor = html.unescape(get_form_val(form, "client_advisor")).strip()
     client_phone_num = get_form_val(form, "client_phone_num") # Retrieved for PDF rendering
 
     street = get_form_val(form, "local_street")
@@ -563,6 +582,7 @@ def compile_reportlab_pdf_buffer(form, include_esign_tags=False):
         FRIENDLY_NAME=xml_safe_escape(friendly_name),
         GREETING_NAME=xml_safe_escape(greeting_name),
         TAX_YEARS_COVERED=xml_safe_escape(tax_years_covered),
+        CLIENT_ADVISOR=xml_safe_escape(client_advisor),
         meta_additional_signer=meta_sig,
         CO_SIGNER_NAME=xml_safe_escape(meta_co_signer_name)
     )
@@ -720,6 +740,7 @@ def execute_transactional_pipeline(form):
     client_qbo_id = extract_qbo_id(client_name)
     friendly_name = html.unescape(get_form_val(form, "friendly_name"))
     local_legal_name = html.unescape(get_form_val(form, "local_legal_name"))
+    target_email = get_form_val(form, "target_email").strip()
     meta_co_signer_name = html.unescape(get_form_val(form, "meta_co_signer_name"))
     meta_sig = get_form_val(form, "meta_additional_signer").strip()
 
@@ -737,11 +758,36 @@ def execute_transactional_pipeline(form):
             pdf_binary_data=live_pdf_buffer.read(),
             additional_signer_email=meta_sig if "@" in meta_sig else None,
             primary_name_override=friendly_name,
-            co_signer_name=meta_co_signer_name
+            co_signer_name=meta_co_signer_name,
+            primary_email_override=target_email if "@" in target_email else None
         )
 
     if not adobe_sign_routing_success:
-        return render_phase1_workspace(error_msg=f"Adobe Sign Routing Error: Consent document delivery failed. Details: {adobe_error_context}")
+        return render_phase1_workspace(
+            error_msg=f"Adobe Sign Routing Error: Consent document delivery failed. Details: {adobe_error_context}",
+            preserved_form=form
+        )
+
+    resolved_target_email = target_email if "@" in target_email else (
+        qbo_api_request(f'customer/{client_qbo_id}').get('Customer', {}).get('PrimaryEmailAddr', {}).get('Address', 'N/A')
+    )
+
+    is_joint = bool(meta_sig and "@" in meta_sig)
+    recipient_display = (
+        f"{html.escape(friendly_name)} &amp; {html.escape(meta_co_signer_name)}"
+        if (is_joint and meta_co_signer_name)
+        else html.escape(friendly_name)
+    )
+    routing_summary = (
+        "prepared for physical signature."
+        if is_paper_mode
+        else "routed via Adobe Sign."
+    )
+    co_signer_line = (
+        f"• Co-Signer: {html.escape(meta_co_signer_name + ' — ' if meta_co_signer_name else '')}{html.escape(meta_sig)}<br>"
+        if is_joint
+        else ""
+    )
 
     success_html = f"""<!DOCTYPE html>
 <html>
@@ -754,15 +800,15 @@ def execute_transactional_pipeline(form):
 <div class="success-wrapper">
     <div class="success-card">
         <div class="icon-circle">✓</div>
-        <h2>Consent Letter Dispatched Successfully</h2>
+        <h2>Consent Letter {"Prepared" if is_paper_mode else "Dispatched"} Successfully</h2>
         <p>
-            Section 7216 Consent document for <strong>{html.escape(friendly_name)}</strong> has been routed via Adobe Sign.
+            Section 7216 Consent document for <strong>{recipient_display}</strong> has been {routing_summary}
         </p>
         <div style="background:#f9fafb; padding:15px; border-radius:4px; border:1px solid #e5e7eb; margin-bottom:20px; text-align:left; font-size:13px; font-family:monospace;">
             <strong>Execution Summary Matrix:</strong><br>
             • Customer Index: {html.escape(client_qbo_id)}<br>
-            • Target Email: {html.escape(qbo_api_request(f'customer/{client_qbo_id}').get('Customer', {}).get('PrimaryEmailAddr', {}).get('Address', 'N/A'))}<br>
-            • Signature Layout: {"JOINT" if (meta_sig and "@" in meta_sig) else "SINGLE"}
+            • Primary Signer: {html.escape(friendly_name)} ({html.escape(resolved_target_email)})<br>
+            {co_signer_line}• Signature Layout: {"JOINT (PARALLEL)" if is_joint else "SINGLE"}
         </div>
         <a href="{SCRIPT_URL}" class="btn-submit" style="background:#0078d4; text-decoration:none; display:inline-block;">Create New Consent Request</a>
     </div>
@@ -776,7 +822,9 @@ def execute_transactional_pipeline(form):
             ("client_name", client_name),
             ("friendly_name", friendly_name),
             ("local_legal_name", local_legal_name),
+            ("target_email", target_email),
             ("tax_years_covered", get_form_val(form, "tax_years_covered")),
+            ("client_advisor", get_form_val(form, "client_advisor")),
             ("client_phone_num", get_form_val(form, "client_phone_num")), # Included in download final link
             ("local_street", get_form_val(form, "local_street")),
             ("local_city", get_form_val(form, "local_city")),

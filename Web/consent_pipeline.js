@@ -1,7 +1,8 @@
 /**
  * Tarrant Advisors - Section 7216 Consent Portal Front-End Orchestrator
- * Controls customer selection changes, dynamic local address fallback rendering,
- * friendly name & legal name population, and form submission validation.
+ * Controls customer selection changes, unified profile metadata rendering
+ * (matching the Engagement Portal UX without QBO write-back or disk persistence),
+ * and form submission validation.
  */
 
 /**
@@ -48,183 +49,128 @@ function onClientChange() {
 
     const clientRecord = window.clientData[selectedClient];
     const address = clientRecord.address || {};
-    const metadata = clientRecord.metadata || {}; // Sourced from QBO Notes JSON via Python backend[cite: 2]
+    const metadata = clientRecord.metadata || {}; // Sourced from QBO Notes JSON via Python backend
     
-    // Support both <input list="..."> and legacy <select> elements for name extraction[cite: 3]
+    // Support both <input list="..."> and legacy <select> elements for name extraction
     const rawText = clientSelect.value || (clientSelect.options && clientSelect.selectedIndex >= 0 ? clientSelect.options[clientSelect.selectedIndex].text : '');
     const rawOptionText = unescapeHtml(rawText);
     const rawCustomerName = rawOptionText.split(/\s*\(Customer/)[0].trim();
 
     const healData = window.preservedHealData || {};
-    
-    // Prioritize preserved data, then metadata friendly name, then raw customer name[cite: 2, 3]
-    const defaultFriendlyName = healData.friendly_name || metadata.friendly_name || rawCustomerName;
-    const defaultLegalName = healData.local_legal_name || rawCustomerName;
 
-    const isAddressMissing = !address.street || !address.city || !address.state || !address.zip;
+    // Prioritize preserved workspace edits, then QBO Notes metadata, then QBO primary fields
+    const profileValues = {
+        friendlyName: healData.friendly_name || metadata.friendly_name || rawCustomerName,
+        legalName: healData.local_legal_name || rawCustomerName,
+        targetEmail: healData.target_email || metadata.primary_signer_email || clientRecord.email || '',
+        phone: healData.client_phone_num || clientRecord.phone || '',
+        street: healData.local_street !== undefined ? healData.local_street : (address.street || ''),
+        city: healData.local_city !== undefined ? healData.local_city : (address.city || ''),
+        state: healData.local_state !== undefined ? healData.local_state : (address.state || ''),
+        zip: healData.local_zip !== undefined ? healData.local_zip : (address.zip || ''),
+        coSignerName: healData.meta_co_signer_name !== undefined ? healData.meta_co_signer_name : (metadata.co_signer_name || ''),
+        coSignerEmail: healData.meta_additional_signer !== undefined ? healData.meta_additional_signer : (metadata.co_signer_email || '')
+    };
+
+    const isProfileIncomplete = !profileValues.street || !profileValues.city || !profileValues.state || !profileValues.zip || !profileValues.targetEmail;
 
     if (profileContainer) {
         profileContainer.style.display = 'block';
-        if (isAddressMissing) {
-            renderFallbackAddressPanel(profileContainer, address, defaultFriendlyName, defaultLegalName, clientRecord.email, clientRecord.phone);
-        } else {
-            renderVerifiedProfilePanel(profileContainer, address, defaultFriendlyName, defaultLegalName, clientRecord.email, clientRecord.phone);
-        }
+        renderProfileMetadataPanel(profileContainer, profileValues, isProfileIncomplete);
     }
 
     if (submitBtn) {
         submitBtn.style.display = 'block';
     }
 
-    // Hydrate preserved form values if available (e.g. on workspace revert or reload)[cite: 3]
-    if (healData.friendly_name) {
-        const friendlyInput = document.querySelector('input[name="friendly_name"]');
-        if (friendlyInput) friendlyInput.value = healData.friendly_name;
-    }
-    if (healData.local_legal_name) {
-        const legalInput = document.querySelector('input[name="local_legal_name"]');
-        if (legalInput) legalInput.value = healData.local_legal_name;
-    }
+    // Hydrate top-level form inputs if preserved from preview revert
     if (healData.tax_years_covered) {
         const taxYearsSelect = document.getElementById('tax-years-covered');
         if (taxYearsSelect) taxYearsSelect.value = healData.tax_years_covered;
     }
-    if (healData.local_street) {
-        const streetInput = document.querySelector('input[name="local_street"]');
-        if (streetInput) streetInput.value = healData.local_street;
-    }
-    if (healData.local_city) {
-        const cityInput = document.querySelector('input[name="local_city"]');
-        if (cityInput) cityInput.value = healData.local_city;
-    }
-    if (healData.local_state) {
-        const stateInput = document.querySelector('input[name="local_state"]');
-        if (stateInput) stateInput.value = healData.local_state;
-    }
-    if (healData.local_zip) {
-        const zipInput = document.querySelector('input[name="local_zip"]');
-        if (zipInput) zipInput.value = healData.local_zip;
-    }
-    if (healData.meta_co_signer_name) {
-        const coSignerNameInput = document.querySelector('input[name="meta_co_signer_name"]');
-        if (coSignerNameInput) coSignerNameInput.value = healData.meta_co_signer_name;
-    }
-    if (healData.meta_additional_signer) {
-        const coSignerEmailInput = document.querySelector('input[name="meta_additional_signer"]');
-        if (coSignerEmailInput) coSignerEmailInput.value = healData.meta_additional_signer;
+    if (healData.client_advisor) {
+        const clientAdvisorInput = document.getElementById('client-advisor');
+        if (clientAdvisorInput) clientAdvisorInput.value = healData.client_advisor;
     }
 
-    // Clear preserved memory after initial hydration pass to prevent leaks across client switches[cite: 3]
+    // Clear preserved memory after initial hydration pass to prevent leaks across client switches
     window.preservedHealData = {};
 }
 
 /**
- * Renders an address fallback panel when QBO address is incomplete.
- * Note: These fields are strictly used for document generation and are NOT written back to QBO.
+ * Renders the unified Client Account & Signer Profile Metadata card matching the Engagement Portal UI.
+ * Note: All fields are strictly local overrides for this consent document and are NEVER saved to disk or written back to QBO.
  */
-function renderFallbackAddressPanel(container, addr, defaultFriendlyName, defaultLegalName, clientEmail, clientPhone) {
-    // Explicitly fallback to empty string to ensure no leak from prior client selection
-    const street = addr.street ? addr.street : '';
-    const city = addr.city ? addr.city : '';
-    const state = addr.state ? addr.state : '';
-    const zip = addr.zip ? addr.zip : '';
+function renderProfileMetadataPanel(container, values, isIncomplete) {
+    const cardClass = isIncomplete ? 'profile-card profile-card-fallback' : 'profile-card profile-card-complete';
+    const titleColor = isIncomplete ? '#b76200' : '#107c41';
+    const titleBadge = isIncomplete
+        ? '⚠️ Client Account & Signer Profile Metadata (Incomplete QBO Record)'
+        : 'Client Account & Signer Profile Metadata';
+
+    const statusBanner = isIncomplete
+        ? `<p style="margin: 0 0 14px 0; font-size: 13px; color: #7c4200;">
+               QuickBooks Online is missing a primary email or complete billing address for this customer. Complete the fields below to generate the consent letter.
+               <em>(Local override only — values are not saved to disk or written back to QBO.)</em>
+           </p>`
+        : `<p style="margin: 0 0 14px 0; font-size: 12px; color: #555;">
+               Pre-populated from QuickBooks Online. Any edits below apply strictly to this consent letter and are <strong>not</strong> saved to disk or written back to QBO.
+           </p>`;
 
     container.innerHTML = `
-        <div class="profile-card profile-card-fallback">
-            <div class="profile-card-title" style="color: #b76200;">⚠️ Incomplete Billing Address in QBO</div>
-            
-            <!-- Hidden input to pass phone number -->
-            <input type="hidden" name="client_phone_num" value="${escapeHtml(clientPhone || '')}">
+        <div class="${cardClass}">
+            <div class="profile-card-title" style="color: ${titleColor};">${titleBadge}</div>
+            ${statusBanner}
 
-            <p style="margin: 0 0 15px 0; font-size: 13px; color: #666;">
-                QuickBooks Online does not have a complete billing address for this customer. Please enter the address below for the consent letter. 
-                <em>(Note: This address will only be used for this consent document and will NOT be written back to QuickBooks Online.)</em>
-            </p>
-
-            <div style="margin-bottom: 15px; padding: 10px; background: #fffcf5; border-left: 3px solid #b76200; font-size: 13px;">
-                <strong>Target Email:</strong> 
-                <span style="font-family: monospace; color: #222;">${clientEmail ? escapeHtml(clientEmail) : '<span style="color: #e53e3e; font-weight: bold;">⚠️ MISSING EMAIL IN QBO!</span>'}</span>
-            </div>
-
-            <div class="profile-grid-layout">
+            <!-- Row 1: Primary Signer Friendly Name, Legal Name, Primary Signer Email, Primary Phone Number -->
+            <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px;">
                 <div class="form-field-group">
-                    <label class="field-label">Signature Name</label>
-                    <input type="text" name="friendly_name" value="${escapeHtml(unescapeHtml(defaultFriendlyName))}" required placeholder="e.g., Jack Fleisher">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Primary Signer Friendly Name:</label>
+                    <input type="text" name="friendly_name" value="${escapeHtml(unescapeHtml(values.friendlyName))}" required placeholder="e.g., Danny Corning">
                 </div>
                 <div class="form-field-group">
-                    <label class="field-label">Client Name</label>
-                    <input type="text" name="local_legal_name" value="${escapeHtml(unescapeHtml(defaultLegalName))}" required placeholder="e.g., Jack Fleisher LLC">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Legal Name / Entity Title:</label>
+                    <input type="text" name="local_legal_name" value="${escapeHtml(unescapeHtml(values.legalName))}" required placeholder="e.g., Corning, Daniel & Catherine">
                 </div>
                 <div class="form-field-group">
-                    <label class="field-label">Street Address (Local Only)</label>
-                    <input type="text" name="local_street" value="${escapeHtml(street)}" required placeholder="e.g., 7520 Woodside Lane">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Primary Signer Email:</label>
+                    <input type="email" name="target_email" value="${escapeHtml(unescapeHtml(values.targetEmail))}" required placeholder="client@example.com">
                 </div>
                 <div class="form-field-group">
-                    <label class="field-label">City (Local Only)</label>
-                    <input type="text" name="local_city" value="${escapeHtml(city)}" required placeholder="e.g., Lorton">
-                </div>
-                <div class="form-field-group">
-                    <label class="field-label">State (Local Only)</label>
-                    <input type="text" name="local_state" value="${escapeHtml(state)}" required placeholder="DC" maxlength="2">
-                </div>
-                <div class="form-field-group">
-                    <label class="field-label">Zip Code (Local Only)</label>
-                    <input type="text" name="local_zip" value="${escapeHtml(zip)}" required placeholder="22079">
-                </div>
-                <div class="form-field-group">
-                    <label class="field-label">Co-Signer Full Name (Optional)</label>
-                    <input type="text" name="meta_co_signer_name" value="" placeholder="e.g., Jane Fleisher">
-                </div>
-                <div class="form-field-group">
-                    <label class="field-label">Co-Signer Email (Optional)</label>
-                    <input type="email" name="meta_additional_signer" value="" placeholder="spouse@example.com">
-                </div>
-            </div>
-        </div>
-    `;
-}
-
-/**
- * Renders verified profile panel when complete customer parameters exist in QBO.
- */
-function renderVerifiedProfilePanel(container, addr, defaultFriendlyName, defaultLegalName, clientEmail, clientPhone) {
-    const formattedAddress = `${addr.street || ''}, ${addr.city || ''}, ${addr.state || ''} ${addr.zip || ''}`;
-
-    container.innerHTML = `
-        <div class="profile-card profile-card-complete">
-            <div class="profile-card-title" style="color: #107c41;">✓ Customer Address Verified</div>
-            
-            <!-- Hidden inputs to pass verified address and phone data -->
-            <input type="hidden" name="local_street" value="${escapeHtml(addr.street || '')}">
-            <input type="hidden" name="local_city" value="${escapeHtml(addr.city || '')}">
-            <input type="hidden" name="local_state" value="${escapeHtml(addr.state || '')}">
-            <input type="hidden" name="local_zip" value="${escapeHtml(addr.zip || '')}">
-            <input type="hidden" name="client_phone_num" value="${escapeHtml(clientPhone || '')}">
-
-            <div style="margin-bottom: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                <div class="form-field-group">
-                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Signature Name (Override if needed)</label>
-                    <input type="text" name="friendly_name" value="${escapeHtml(unescapeHtml(defaultFriendlyName))}" required>
-                </div>
-                <div class="form-field-group">
-                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Client Name (used in QuickBooks & SharePoint)</label>
-                    <input type="text" name="local_legal_name" value="${escapeHtml(unescapeHtml(defaultLegalName))}" required>
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Primary Phone Number:</label>
+                    <input type="text" name="client_phone_num" value="${escapeHtml(unescapeHtml(values.phone))}" placeholder="(555) 555-5555">
                 </div>
             </div>
 
-            <div class="profile-grid-layout">
-                <div class="verify-text"><strong>Billing Address:</strong><br><span style="color:#555;">${escapeHtml(formattedAddress)}</span></div>
-                <div class="verify-text"><strong>Target Email:</strong><br><span style="color:#555; font-family: monospace;">${clientEmail ? escapeHtml(clientEmail) : '[None Sourced]'}</span></div>
-            </div>
-
-            <div style="margin-top: 15px; padding-top: 12px; border-top: 1px dashed #c6f6d5;" class="profile-grid-layout">
+            <!-- Row 2: Street Address, City, State, Zip Code -->
+            <div style="display: grid; grid-template-columns: 1.5fr 1fr 0.6fr 0.8fr; gap: 12px; margin-bottom: 12px;">
                 <div class="form-field-group">
-                    <label class="field-label">Co-Signer Full Name (Optional)</label>
-                    <input type="text" name="meta_co_signer_name" value="" placeholder="e.g., Jane Fleisher">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Street Address:</label>
+                    <input type="text" name="local_street" value="${escapeHtml(unescapeHtml(values.street))}" required placeholder="e.g., 1525 Melton Rd">
                 </div>
                 <div class="form-field-group">
-                    <label class="field-label">Co-Signer Email (Optional)</label>
-                    <input type="email" name="meta_additional_signer" value="" placeholder="spouse@example.com">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">City:</label>
+                    <input type="text" name="local_city" value="${escapeHtml(unescapeHtml(values.city))}" required placeholder="e.g., Lutherville Timonium">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">State:</label>
+                    <input type="text" name="local_state" value="${escapeHtml(unescapeHtml(values.state))}" required placeholder="MD" maxlength="2">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Zip Code:</label>
+                    <input type="text" name="local_zip" value="${escapeHtml(unescapeHtml(values.zip))}" required placeholder="21093">
+                </div>
+            </div>
+
+            <!-- Row 3: Co-Signer Full Name, Co-Signer Email Address -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                <div class="form-field-group">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Co-Signer Full Name (Joint Return):</label>
+                    <input type="text" name="meta_co_signer_name" value="${escapeHtml(unescapeHtml(values.coSignerName))}" placeholder="e.g., Katie Corning">
+                </div>
+                <div class="form-field-group">
+                    <label class="field-label" style="font-weight: 600; font-size: 13px;">Co-Signer Email Address:</label>
+                    <input type="email" name="meta_additional_signer" value="${escapeHtml(unescapeHtml(values.coSignerEmail))}" placeholder="spouse@example.com">
                 </div>
             </div>
         </div>
@@ -243,6 +189,19 @@ document.addEventListener('DOMContentLoaded', () => {
         const clientSelect = document.getElementById('client-select');
         if (!clientSelect || !clientSelect.value) return true;
 
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+        const targetEmailInput = document.querySelector('input[name="target_email"]');
+        if (targetEmailInput) {
+            const targetEmailVal = targetEmailInput.value.trim();
+            if (!targetEmailVal || !emailRegex.test(targetEmailVal)) {
+                alert("Please enter a valid email address for Primary Signer Email.");
+                targetEmailInput.focus();
+                e.preventDefault();
+                return false;
+            }
+        }
+
         const addSignerInput = document.querySelector('input[name="meta_additional_signer"]');
         const coSignerNameInput = document.querySelector('input[name="meta_co_signer_name"]');
 
@@ -250,19 +209,21 @@ document.addEventListener('DOMContentLoaded', () => {
         const hasName = coSignerNameInput && coSignerNameInput.value.trim() !== "";
 
         if (hasEmail || hasName) {
-            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
             if (hasEmail && !emailRegex.test(addSignerInput.value.trim())) {
-                alert("Please enter a valid email address for the Co-Signer Email field.");
+                alert("Please enter a valid email address for Co-Signer Email Address.");
+                addSignerInput.focus();
                 e.preventDefault();
                 return false;
             }
             if (hasEmail && !hasName) {
-                alert("Please enter the Co-Signer's Full Name along with their email address.");
+                alert("Please enter the Co-Signer Full Name along with their email address.");
+                coSignerNameInput.focus();
                 e.preventDefault();
                 return false;
             }
             if (hasName && !hasEmail) {
-                alert("Please enter the Co-Signer's Email Address along with their full name.");
+                alert("Please enter the Co-Signer Email Address along with their full name.");
+                addSignerInput.focus();
                 e.preventDefault();
                 return false;
             }
