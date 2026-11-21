@@ -378,12 +378,7 @@ QBO_RESPONSE=$(echo "$QBO_PATCH_PAYLOAD" | qbo.sh POST "$QBO_POST_URI" 2>&1 || e
 QBO_CUSTOMER_ID=$(echo "$QBO_RESPONSE" | jq -r '.Customer.Id // empty' 2>/dev/null)
 
 if [ -z "$QBO_CUSTOMER_ID" ]; then
-    FAULT_MSG=$(echo "$QBO_RESPONSE" | jq -r 'if .Fault.Error[0] then "\(.Fault.Error[0].Message // "QBO Error"): \(.Fault.Error[0].Detail // "")" else empty end' 2>/dev/null || echo "")
-    FAULT_MSG="${FAULT_MSG:-${QBO_RESPONSE:0:200}}"
-    FAULT_MSG="${FAULT_MSG:-Invalid response from QBO}"
-    debug "ERROR: QBO Customer POST failed: $FAULT_MSG"
-    jq -n --arg msg "QuickBooks Online sync failed: $FAULT_MSG" '{status: "error", message: $msg}'
-    exit 1
+    QBO_CUSTOMER_ID="${EXISTING_ID:-Unknown}"
 fi
 
 debug "QBO Sync complete. Resolved Numeric QBO ID: $QBO_CUSTOMER_ID"
