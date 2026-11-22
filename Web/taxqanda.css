@@ -98,6 +98,10 @@ h2 {
     gap: 4px;
 }
 
+#status-strip {
+    display: none !important;
+}
+
 .status-chip {
     font-size: 8.5px;
     font-weight: 700;
@@ -179,6 +183,10 @@ select {
     letter-spacing: 0.4px;
     color: var(--warn-text);
     margin-right: 2px;
+}
+
+#highlights-banner {
+    display: none !important;
 }
 
 .flag-pill {
