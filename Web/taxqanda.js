@@ -115,9 +115,9 @@
             return renderRow("Account Number", "—");
         }
         const clean = acctNum.replace(/\s+/g, "");
-        const masked = clean.length > 4 ? "••••" + clean.slice(-4) : clean;
+        const masked = clean.length > 4 ? "••••" + clean.slice(-4) : "•".repeat(clean.length);
         const screenVal = acctRevealed ? clean : masked;
-        const toggleBtn = `<button type="button" class="toggle-acct no-print" id="btn-toggle-acct">${acctRevealed ? "Hide" : "Show"}</button>`;
+        const toggleBtn = `<button type="button" class="toggle-acct no-print" data-action="toggle-acct">${acctRevealed ? "Hide" : "Show"}</button>`;
         return `
             <div class="item-row">
                 <span class="label">Account Number</span>
@@ -406,14 +406,6 @@
             renderRow("Taxpayer Pres. Fund ($3)?", getVal(rec, "pres_fund_taxpayer")) +
             renderRow("Spouse Pres. Fund ($3)?", getVal(rec, "pres_fund_spouse")) +
             renderStacked("Additional Client Notes", getVal(rec, "additional_comments"), { hideIfEmpty: true });
-
-        const toggleBtn = document.getElementById("btn-toggle-acct");
-        if (toggleBtn) {
-            toggleBtn.addEventListener("click", function () {
-                acctRevealed = !acctRevealed;
-                updateDashboard(currentIdx, false);
-            });
-        }
     }
 
     function printSummary() {
@@ -468,7 +460,6 @@
                 url.searchParams.set("form", this.value);
                 url.searchParams.delete("year");
                 url.searchParams.delete("idx");
-                // Preserve customer key across form years if currently viewing a keyed client!
                 if (currentIdx !== null && RESPONDENTS[currentIdx]) {
                     const activeKey = getVal(RESPONDENTS[currentIdx], "customer_key");
                     if (hasValue(activeKey)) {
@@ -485,6 +476,19 @@
             });
 
             document.getElementById("btn-print-summary").addEventListener("click", printSummary);
+        }
+
+        // Delegated listener for bank account Show/Hide toggle (works across all renders & embed mode)
+        const bankingCard = document.getElementById("group-banking-compliance");
+        if (bankingCard) {
+            bankingCard.addEventListener("click", function (e) {
+                if (e.target && e.target.closest("[data-action='toggle-acct']")) {
+                    acctRevealed = !acctRevealed;
+                    if (currentIdx !== null) {
+                        updateDashboard(currentIdx, false);
+                    }
+                }
+            });
         }
 
         if (BOOT.initialIdx !== null && RESPONDENTS[BOOT.initialIdx]) {
