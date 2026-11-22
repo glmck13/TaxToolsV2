@@ -282,10 +282,11 @@
 
         document.getElementById("header-title").textContent = `${yr} Tax Q&A: ${rec.client_name}`;
 
+        const msFormsUrl = `https://forms.cloud.microsoft/Pages/DesignPageV2.aspx?subpage=design&id=${encodeURIComponent(FORM_META.form_id)}&analysis=true&topview=SurveyResults&ridx=${rec._id}`;
+
         const metaEl = document.getElementById("header-meta");
-        metaEl.textContent = hasValue(custKey)
-            ? `Key: ${custKey}  |  Printed: ${BOOT.generatedDate}`
-            : `Printed: ${BOOT.generatedDate}`;
+        const keyPart = hasValue(custKey) ? `Key: ${escHtml(custKey)}  |  ` : "";
+        metaEl.innerHTML = `${keyPart}Printed: ${escHtml(BOOT.generatedDate)}  |  <a href="${msFormsUrl}" target="_blank" rel="noopener" class="no-print" style="color:#1e40af; text-decoration:underline;">MS Forms #${rec._id + 1} ↗</a>`;
         metaEl.style.display = "inline-block";
 
         renderStatusChips(rec);

@@ -218,7 +218,7 @@ elif client_index is not None:
         client_index = 0
 
 # Build client bootstrap payload
-public_form_meta = {k: v for k, v in active_form.items() if k != "form_id"}
+public_form_meta = dict(active_form)
 available_forms = [{"key": k, "label": v["label"]} for k, v in FORMS.items()]
 
 boot_payload = {
