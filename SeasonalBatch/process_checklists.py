@@ -2,17 +2,18 @@
 """
 Master Checklist Processing Pipeline:
 1. Reads ProConnect cURL headers from stdin.
-2. Queries QBO API to map QBO_Id <-> ProConnect ClientEntityId and resolve customer emails.
+2. Queries QBO API to map QBO_Id <-> ProConnect ClientEntityId and resolve customer emails (merging PrimaryEmailAddr and Notes.signers).
 3. Iterates over qbosp.csv (master customer list).
-4. Fetches raw JSON checklists from ProConnect API.
-5. Stages raw checklist JSON payloads locally in checklists/{qbo_id}.json (translating QBO ID if --xlate is provided).
-6. Builds formatted .xlsx workbooks using openpyxl matching the dropdown styling layout.
-7. Ensures /{TAX_YEAR} subfolder exists under client folder on SharePoint.
-8. Uploads .xlsx to SharePoint via m365 CLI with local staging to guarantee target file naming.
-9. Creates and obtains folder sharing links via 'm365 spo folder sharinglink add' with scope 'users' and recipient email.
-10. Generates direct web viewer link for the .xlsx file.
-11. Outputs sp_checklists.json keyed by Production QBO Customer Id.
-12. Includes --cleanup mode to back out sharing links and remove created checklist files.
+4. Fetches raw JSON checklists from ProConnect API (logging [INFO] and continuing without staging JSON/.xlsx if no checklist exists yet).
+5. When checklist data is returned, stages raw checklist JSON payloads locally in checklists/{qbo_id}.json (translating QBO ID if --xlate is provided).
+6. Ensures /{TAX_YEAR} subfolder exists under client folder on SharePoint.
+7. Resolves folder sharing link (reusing cached folder_url, reusing existing SharePoint 'edit' link covering all
+   QBO emails with folder_link_id=null, or creating a new link via 'm365 spo folder sharinglink add').
+8. If checklist data is present (and not already uploaded unless --force-upload is set), builds formatted .xlsx
+   workbook with openpyxl, uploads via m365 CLI, and generates direct Excel Online edit link (Doc.aspx?action=edit).
+9. Maintains sp_links.json as a read-write state manifest keyed by Production QBO Customer Id.
+10. Includes --cleanup mode to revoke script-created sharing links (where folder_link_id is non-null), delete uploaded
+    checklist files, and reset folder_url and folder_link_id to null in sp_links.json.
 """
 
 import os
@@ -25,8 +26,9 @@ import tempfile
 import subprocess
 import urllib.parse
 import urllib.request
+import urllib.error
 import argparse
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List, Set
 
 try:
     import openpyxl
@@ -48,13 +50,13 @@ QBO_APIBASE = os.environ.get("QBO_APIBASE", "").rstrip("/")
 QBO_REALMID = os.environ.get("QBO_REALMID", "")
 QBO_ACCESS_TOKEN = os.environ.get("QBO_ACCESS_TOKEN", "")
 
-SPO_SITE_URL = os.environ.get("SPO_SITE_URL", "")
-SPO_DOC_LIBRARY = os.environ.get("SPO_DOC_LIBRARY", "Shared Documents")
+SITE_URL = os.environ.get("SITE_URL", "")
+DOC_LIBRARY = os.environ.get("DOC_LIBRARY", "Shared Documents")
 TAX_YEAR = os.environ.get("TAX_YEAR", "2026")
 
 
 # ==========================================
-# ID MAPPING LOADER (--xlate)
+# ID MAPPING & STATE MANIFEST HELPERS
 # ==========================================
 def load_id_mapping(xlate_path: str) -> Dict[str, Any]:
     """Loads production-to-sandbox ID mapping file."""
@@ -66,75 +68,79 @@ def load_id_mapping(xlate_path: str) -> Dict[str, Any]:
             print(f"[WARNING] Failed reading ID mapping file {xlate_path}: {e}", file=sys.stderr)
     elif xlate_path:
         print(f"[WARNING] ID mapping file not found: {xlate_path}", file=sys.stderr)
-    return {"customers": {}, "services": {}}
+    return {"customers": {}}
+
+
+def load_links_manifest(json_path: str) -> Dict[str, Dict[str, Any]]:
+    """Loads existing sp_links.json state manifest if present."""
+    if json_path and os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            print(f"[WARNING] Failed reading existing links manifest {json_path}: {e}", file=sys.stderr)
+    return {}
+
+
+def save_links_manifest(json_path: str, data: Dict[str, Dict[str, Any]]):
+    """Atomically persists sp_links.json state manifest to disk."""
+    parent_dir = os.path.dirname(os.path.abspath(json_path))
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+    tmp_path = f"{json_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, json_path)
 
 
 # ==========================================
 # SHARING LINK BACKOUT & CLEANUP HELPERS
 # ==========================================
-def backout_sharing_links(site_url: str, folder_relative_path: str):
+def remove_specific_sharing_link(site_url: str, folder_relative_path: str, link_id: str) -> bool:
     """
-    Lists and deletes all active sharing links on a target folder using M365 CLI.
-    Executed exclusively during --cleanup mode.
+    Revokes a specific script-created sharing link by ID on a target folder using M365 CLI.
+    Executed exclusively during --cleanup mode when folder_link_id is non-null.
     """
     clean_site_url = site_url.rstrip("/")
     clean_folder_path = "/" + urllib.parse.unquote(folder_relative_path).lstrip("/")
 
-    list_cmd = [
-        "m365", "spo", "folder", "sharinglink", "list",
+    remove_cmd = [
+        "m365", "spo", "folder", "sharinglink", "remove",
         "--webUrl", clean_site_url,
         "--folderUrl", clean_folder_path,
-        "-o", "json"
+        "--id", link_id,
+        "--force"
     ]
 
     try:
-        res = subprocess.run(list_cmd, capture_output=True, text=True, check=True)
-        links = json.loads(res.stdout or "[]")
-        if not isinstance(links, list):
-            links = []
-    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-        print(f"  ├─ [CLEANUP WARNING] Could not retrieve sharing links for {clean_folder_path}: {e}", file=sys.stderr)
-        return
-
-    if not links:
-        print(f"  ├─ No active sharing links found on: {clean_folder_path}", file=sys.stderr)
-        return
-
-    for link in links:
-        link_id = link.get("id")
-        if not link_id:
-            continue
-        
-        remove_cmd = [
-            "m365", "spo", "folder", "sharinglink", "remove",
-            "--webUrl", clean_site_url,
-            "--folderUrl", clean_folder_path,
-            "--id", link_id,
-            "--force"
-        ]
-        
-        try:
-            subprocess.run(remove_cmd, capture_output=True, text=True, check=True)
-            print(f"  ├─ Removed Sharing Link ID '{link_id}' from {clean_folder_path}", file=sys.stderr)
-        except subprocess.CalledProcessError as e:
-            err_msg = (e.stderr or e.stdout or "").strip()
-            print(f"  ├─ [ERROR] Failed to remove link '{link_id}': {err_msg}", file=sys.stderr)
+        subprocess.run(remove_cmd, capture_output=True, text=True, check=True)
+        print(f"  ├─ Removed script-created Sharing Link ID '{link_id}' from {clean_folder_path}", file=sys.stderr)
+        return True
+    except subprocess.CalledProcessError as e:
+        err_msg = (e.stderr or e.stdout or "").strip()
+        print(f"  ├─ [ERROR] Failed to remove link '{link_id}': {err_msg}", file=sys.stderr)
+        return False
 
 
 def run_cleanup_mode(json_file_path: str, site_url: str):
     """
-    Reads sp_checklists.json, revokes sharing links on parent client folders via M365 CLI,
-    and deletes the created checklist .xlsx files from SharePoint.
+    Reads sp_links.json, revokes script-created sharing links (only where folder_link_id is non-null),
+    deletes the created checklist .xlsx files from SharePoint, and resets folder_url and folder_link_id
+    to null in sp_links.json.
     """
     if not os.path.exists(json_file_path):
         print(f"[ERROR] JSON file not found for cleanup: {json_file_path}", file=sys.stderr)
         sys.exit(1)
 
     if not site_url:
-        print("[ERROR] SharePoint site URL is required. Pass --site-url or set SPO_SITE_URL.", file=sys.stderr)
+        print("[ERROR] SharePoint site URL is required. Pass --site-url or set SITE_URL.", file=sys.stderr)
         sys.exit(1)
 
     clean_site_url = site_url.rstrip("/")
+    parsed_site = urllib.parse.urlparse(clean_site_url)
+    site_path = parsed_site.path.rstrip("/")
 
     try:
         with open(json_file_path, "r", encoding="utf-8") as f:
@@ -143,72 +149,77 @@ def run_cleanup_mode(json_file_path: str, site_url: str):
         print(f"[ERROR] Failed to read {json_file_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if not data:
+    if not data or not isinstance(data, dict):
         print(f"[INFO] {json_file_path} is empty. Nothing to clean up.", file=sys.stderr)
         return
 
     print(f"\n[CLEANUP] Starting backout for {len(data)} entry/entries from {json_file_path}...\n", file=sys.stderr)
 
-    for qbo_id, entry in data.items():
-        folder_url = entry.get("folder_url", "")
-        checklist_url = entry.get("checklist_url", "")
+    for qbo_id, raw_entry in data.items():
+        entry = raw_entry if isinstance(raw_entry, dict) else {}
+        folder_path = str(entry.get("folder_path") or "").strip()
+        raw_link_id = entry.get("folder_link_id")
+        folder_link_id = str(raw_link_id).strip() if raw_link_id is not None else ""
+        checklist_url = str(entry.get("checklist_url") or "").strip()
 
         print(f"[*] Processing Cleanup for QBO ID: {qbo_id}", file=sys.stderr)
 
-        # 1. Back out sharing links from parent client folder
-        if folder_url:
-            parsed_folder = urllib.parse.urlparse(folder_url)
-            raw_folder_path = urllib.parse.unquote(parsed_folder.path)
-            
-            parsed_site = urllib.parse.urlparse(clean_site_url)
-            site_path = parsed_site.path.rstrip('/')
-            
-            if site_path and raw_folder_path.startswith(site_path):
-                folder_relative = raw_folder_path[len(site_path):]
+        # 1. Revoke script-created sharing link only if folder_link_id is non-null
+        if folder_link_id:
+            if folder_path:
+                remove_specific_sharing_link(clean_site_url, folder_path, folder_link_id)
             else:
-                folder_relative = raw_folder_path
+                print(f"  ├─ [CLEANUP WARNING] Missing folder_path for QBO ID {qbo_id}; cannot remove link ID '{folder_link_id}'.", file=sys.stderr)
+        else:
+            print(f"  ├─ Pre-existing or unset sharing link (folder_link_id is null) for QBO ID {qbo_id}; leaving SharePoint link untouched.", file=sys.stderr)
 
-            backout_sharing_links(clean_site_url, folder_relative)
-
-        # 2. Extract and delete target .xlsx file
-        if checklist_url and "id=" in checklist_url:
+        # 2. Extract site-relative path and delete target .xlsx file via --url
+        if checklist_url and ("sourcedoc=" in checklist_url or "id=" in checklist_url):
             parsed_checklist = urllib.parse.urlparse(checklist_url)
             qs = urllib.parse.parse_qs(parsed_checklist.query)
-            raw_file_id = qs.get("id", [""])[0]
-            
+            raw_file_id = (qs.get("sourcedoc") or qs.get("id") or [""])[0]
             file_server_relative = urllib.parse.unquote(raw_file_id)
 
-            if file_server_relative:
+            if site_path and file_server_relative.startswith(site_path):
+                file_site_relative = file_server_relative[len(site_path):]
+            else:
+                file_site_relative = file_server_relative
+
+            if file_site_relative:
                 delete_cmd = [
                     "m365", "spo", "file", "remove",
                     "--webUrl", clean_site_url,
-                    "--fileUrl", file_server_relative,
+                    "--url", file_site_relative,
                     "--force"
                 ]
                 try:
                     subprocess.run(delete_cmd, capture_output=True, text=True, check=True)
-                    print(f"  └─ Successfully deleted checklist file: {file_server_relative}", file=sys.stderr)
+                    print(f"  ├─ Successfully deleted checklist file: {file_site_relative}", file=sys.stderr)
                 except subprocess.CalledProcessError as e:
                     err_msg = (e.stderr or e.stdout or "").strip()
-                    print(f"  └─ [ERROR] Failed deleting file {file_server_relative}: {err_msg}", file=sys.stderr)
+                    print(f"  ├─ [ERROR] Failed deleting file {file_site_relative}: {err_msg}", file=sys.stderr)
 
-    print(f"\n[CLEANUP COMPLETE] Finished backing out links and files.", file=sys.stderr)
+        # 3. Reset folder_url and folder_link_id to null (and clear checklist_url) in sp_links.json
+        data[qbo_id] = {
+            "folder_path": folder_path,
+            "folder_url": None,
+            "folder_link_id": None,
+            "checklist_url": ""
+        }
+        save_links_manifest(json_file_path, data)
+        print(f"  └─ Reset folder_url and folder_link_id to null in {json_file_path}", file=sys.stderr)
+
+    print(f"\n[CLEANUP COMPLETE] Finished backing out links and files. Updated {json_file_path}.", file=sys.stderr)
 
 
 # ==========================================
 # CURL HEADER PARSER (ProConnect Auth)
 # ==========================================
 def parse_curl_headers() -> Dict[str, str]:
-    """Parses cURL command input from stdin or CGI POST data to extract authorization headers."""
-    if os.environ.get("REQUEST_METHOD") == "POST":
-        length = int(os.environ.get("CONTENT_LENGTH", 0))
-        body = sys.stdin.read(length)
-        params = urllib.parse.parse_qs(body)
-        curl_input = params.get("clipboard_content", [None])[0] or ""
-    else:
-        if sys.stdin.isatty():
-            print("[WARNING] Stdin is a terminal. Paste cURL headers and press Ctrl+D:", file=sys.stderr)
-        curl_input = sys.stdin.read()
+    """Parses cURL command input from stdin to extract authorization headers."""
+    if sys.stdin.isatty():
+        print("[WARNING] Stdin is a terminal. Paste cURL headers and press Ctrl+D:", file=sys.stderr)
+    curl_input = sys.stdin.read()
 
     headers = {}
     try:
@@ -231,12 +242,17 @@ def parse_curl_headers() -> Dict[str, str]:
     return headers
 
 
-def fetch_intuit_json(url: str, headers: Dict[str, str]) -> Optional[Any]:
+def fetch_intuit_json(url: str, headers: Dict[str, str], allow_404: bool = False) -> Optional[Any]:
     """Executes HTTP GET against Intuit ProConnect endpoints."""
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if allow_404 and e.code == 404:
+            return None
+        print(f"[FETCH ERROR] Failed request to {url}: {e}", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"[FETCH ERROR] Failed request to {url}: {e}", file=sys.stderr)
         return None
@@ -274,6 +290,7 @@ def get_qbo_customer_metadata() -> Dict[str, Dict[str, str]]:
     """
     Queries active QBO customers and builds metadata lookup:
     QBO_Id -> { "client_entity_id": ..., "email": ... }
+    Merges PrimaryEmailAddr and all signer emails from Notes JSON.
     """
     print("[INFO] Querying QBO active customer records...", file=sys.stderr)
     res = qbo_api_query("select * from Customer WHERE Active = true MAXRESULTS 1000")
@@ -285,22 +302,40 @@ def get_qbo_customer_metadata() -> Dict[str, Dict[str, str]]:
         client_entity_id = c.get("ClientEntityId") or ""
         
         raw_c_email = c.get("PrimaryEmailAddr", {}).get("Address", "")
-        primary_email = raw_c_email.split(",")[0].strip() if raw_c_email else ""
+        primary_emails = [
+            addr.strip() for addr in raw_c_email.split(",") if addr.strip()
+        ] if raw_c_email else []
         
-        notes_email = ""
+        notes_emails = []
         if c.get("Notes"):
             try:
                 notes_obj = json.loads(c["Notes"])
-                if not client_entity_id:
-                    client_entity_id = str(notes_obj.get("client_id") or notes_obj.get("ClientEntityId") or "")
-                
-                signers = notes_obj.get("signers", [])
-                if isinstance(signers, list) and len(signers) > 0 and isinstance(signers[0], dict):
-                    notes_email = str(signers[0].get("email", "")).strip()
+                if isinstance(notes_obj, str):
+                    notes_obj = json.loads(notes_obj)
+                if isinstance(notes_obj, dict):
+                    if not client_entity_id:
+                        client_entity_id = str(notes_obj.get("client_id") or notes_obj.get("ClientEntityId") or "")
+                    
+                    signers = notes_obj.get("signers", [])
+                    if isinstance(signers, list):
+                        for signer in signers:
+                            if isinstance(signer, dict):
+                                s_email = str(signer.get("email", "")).strip()
+                                if s_email:
+                                    notes_emails.append(s_email)
             except Exception:
                 pass
 
-        effective_email = primary_email or notes_email
+        raw_emails = primary_emails + notes_emails
+        seen = set()
+        unique_emails = []
+        for email in raw_emails:
+            lower_email = email.lower()
+            if lower_email not in seen:
+                seen.add(lower_email)
+                unique_emails.append(email)
+
+        effective_email = ",".join(unique_emails)
 
         qbo_meta[qbo_id] = {
             "client_entity_id": str(client_entity_id),
@@ -485,32 +520,217 @@ def ensure_sharepoint_folder(site_url: str, folder_path: str):
         pass
 
 
-def process_sharepoint_upload_and_sharing(
+def _extract_recipient_emails(link_item: Dict[str, Any]) -> Set[str]:
+    """Extracts all lowercased recipient email addresses from a Graph/SPO sharing link object."""
+    emails: Set[str] = set()
+
+    def _collect_from_identity(identity_obj: Any):
+        if not isinstance(identity_obj, dict):
+            return
+        user_obj = identity_obj.get("user")
+        if isinstance(user_obj, dict):
+            for key in ("email", "userPrincipalName", "loginName"):
+                val = str(user_obj.get(key) or "").strip().lower()
+                if "@" in val:
+                    # Strip SharePoint claims prefix (e.g., i:0#.f|membership|user@domain.com)
+                    if "|" in val:
+                        val = val.split("|")[-1]
+                    emails.add(val)
+        for key in ("email", "userPrincipalName"):
+            val = str(identity_obj.get(key) or "").strip().lower()
+            if "@" in val:
+                emails.add(val)
+
+    for list_key in ("grantedToIdentitiesV2", "grantedToIdentities"):
+        identities = link_item.get(list_key)
+        if isinstance(identities, list):
+            for ident in identities:
+                _collect_from_identity(ident)
+
+    single_ident = link_item.get("grantedToV2") or link_item.get("grantedTo")
+    if single_ident:
+        _collect_from_identity(single_ident)
+
+    return emails
+
+
+def find_existing_edit_sharing_link(
+    site_url: str,
+    folder_relative_path: str,
+    required_emails: List[str]
+) -> Optional[str]:
+    """
+    Queries existing sharing links on folder_relative_path via 'm365 spo folder sharinglink list'.
+    Returns the webUrl of an existing link ONLY IF:
+      1. It grants 'edit' / 'write' permissions (view-only links are ignored).
+      2. Every email in required_emails is present on that link.
+    Returns None if no qualifying link exists.
+    """
+    target_emails = {e.strip().lower() for e in required_emails if e.strip()}
+    if not target_emails:
+        return None
+
+    list_cmd = [
+        "m365", "spo", "folder", "sharinglink", "list",
+        "--webUrl", site_url,
+        "--folderUrl", folder_relative_path,
+        "-o", "json"
+    ]
+
+    try:
+        res = subprocess.run(list_cmd, capture_output=True, text=True, check=True)
+        links = json.loads(res.stdout or "[]")
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        err_msg = (getattr(e, 'stderr', None) or getattr(e, 'stdout', None) or str(e)).strip()
+        print(f"  ├─ [WARNING] Failed listing existing sharing links for {folder_relative_path}: {err_msg}", file=sys.stderr)
+        return None
+
+    if not isinstance(links, list):
+        return None
+
+    for item in links:
+        if not isinstance(item, dict):
+            continue
+
+        link_obj = item.get("link") if isinstance(item.get("link"), dict) else {}
+        link_type = str(link_obj.get("type") or item.get("type") or "").strip().lower()
+        roles = [str(r).strip().lower() for r in (item.get("roles") or [])]
+        web_url = str(link_obj.get("webUrl") or item.get("webUrl") or item.get("Url") or "").strip()
+
+        is_edit = (link_type == "edit") or ("write" in roles)
+        if not is_edit or not web_url:
+            continue
+
+        link_emails = _extract_recipient_emails(item)
+        if target_emails.issubset(link_emails):
+            return web_url
+
+    return None
+
+
+def resolve_folder_sharing_link(
+    site_url: str,
+    folder_relative_path: str,
+    sp_folder: str,
+    client_email: str,
+    existing_link_entry: Optional[Dict[str, Any]] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolves folder sharing link in priority order:
+      a) Reuse cached folder_url (and folder_link_id) from sp_links.json if present.
+      b) Inspect existing SharePoint folder sharing links via 'm365 spo folder sharinglink list':
+         if an 'edit' link exists that includes ALL QBO emails, reuse its URL and set folder_link_id = None.
+      c) Otherwise create a new 'edit' sharing link via 'm365 spo folder sharinglink add' and store both
+         folder_url and folder_link_id.
+    Returns: (folder_url, folder_link_id)
+    """
+    clean_site_url = site_url.rstrip("/")
+    existing = existing_link_entry or {}
+    raw_cached_url = existing.get("folder_url")
+    raw_cached_id = existing.get("folder_link_id")
+
+    folder_url: Optional[str] = str(raw_cached_url).strip() if raw_cached_url else None
+    folder_link_id: Optional[str] = str(raw_cached_id).strip() if raw_cached_id else None
+
+    if folder_url:
+        print(f"  ├─ Reusing cached sharing link from manifest for folder {sp_folder} (Link ID: {folder_link_id or 'null'})", file=sys.stderr)
+        return folder_url, folder_link_id
+
+    recipient_list = [e.strip() for e in (client_email or "").split(",") if e.strip()]
+    if not recipient_list:
+        print(f"  ├─ [WARNING] No client email found in QBO for folder '{sp_folder}'. Skipping sharing link resolution.", file=sys.stderr)
+        return None, None
+
+    existing_sp_url = find_existing_edit_sharing_link(clean_site_url, folder_relative_path, recipient_list)
+    if existing_sp_url:
+        print(f"  ├─ Found existing SharePoint edit link covering all QBO email(s) ({', '.join(recipient_list)}); storing folder_link_id=null", file=sys.stderr)
+        return existing_sp_url, None
+
+    recipients_arg = ",".join(recipient_list)
+    add_link_cmd = [
+        "m365", "spo", "folder", "sharinglink", "add",
+        "--webUrl", clean_site_url,
+        "--folderUrl", folder_relative_path,
+        "--type", "edit",
+        "--scope", "users",
+        "--recipients", recipients_arg,
+        "-o", "json"
+    ]
+    try:
+        res = subprocess.run(add_link_cmd, capture_output=True, text=True, check=True)
+        link_data = json.loads(res.stdout or "{}")
+        if isinstance(link_data, list) and len(link_data) > 0:
+            link_data = link_data[0]
+        if isinstance(link_data, dict):
+            extracted_id = str(link_data.get("id") or "").strip()
+            folder_link_id = extracted_id if extracted_id else None
+            link_obj = link_data.get("link")
+            if isinstance(link_obj, dict):
+                extracted_url = str(link_obj.get("webUrl") or "").strip()
+            else:
+                extracted_url = str(link_obj or link_data.get("Url") or link_data.get("webUrl") or "").strip()
+            folder_url = extracted_url if extracted_url else None
+
+        if folder_url:
+            print(f"  ├─ Created new sharing link for folder {sp_folder} (ID: {folder_link_id or 'null'}, Recipients: {recipients_arg})", file=sys.stderr)
+        else:
+            folder_link_id = None
+            print(f"  ├─ [M365 SHARING LINK ERROR] Command succeeded but returned no sharing URL for {sp_folder}.", file=sys.stderr)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        err_msg = (getattr(e, 'stderr', None) or getattr(e, 'stdout', None) or str(e)).strip()
+        print(f"  ├─ [M365 SHARING LINK ERROR] Failed creating folder sharing link for {sp_folder}: {err_msg}", file=sys.stderr)
+        folder_url = None
+        folder_link_id = None
+
+    return folder_url, folder_link_id
+
+
+def process_sharepoint_folder_and_checklist(
     site_url: str,
     doc_lib: str,
     sp_folder: str,
     tax_year: str,
     client_email: str,
-    local_file_path: str,
-    remote_filename: str
-) -> Tuple[Optional[str], Optional[str]]:
+    local_file_path: Optional[str],
+    remote_filename: str,
+    existing_link_entry: Optional[Dict[str, Any]] = None,
+    force_upload: bool = False
+) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
     """
     1. Ensures /{TAX_YEAR} subfolder exists under client folder.
-    2. Uploads file via m365 spo file add using local named copy.
-    3. Creates/obtains folder sharing link via m365 spo folder sharinglink add with scope 'users' and recipients.
-    4. Generates direct web-editor viewing URL for the .xlsx file.
-    Returns: (folder_url, checklist_url)
+    2. Resolves folder sharing link (manifest cache -> existing SPO edit link -> create new link).
+    3. If local_file_path is provided (checklist exists), uploads .xlsx unless checklist_url is already
+       cached (and force_upload is False), and returns the direct Excel Online edit URL (Doc.aspx).
+       If local_file_path is None (no checklist in ProConnect), preserves any existing checklist_url or returns "".
+    Returns: (folder_relative_path, folder_url, folder_link_id, checklist_url)
     """
     clean_site_url = site_url.rstrip("/")
     base_folder_path = f"{doc_lib}/{sp_folder}".strip("/")
     year_folder_path = f"{base_folder_path}/{tax_year}"
+    folder_relative_path = f"/{doc_lib}/{sp_folder}".replace("//", "/")
 
     ensure_sharepoint_folder(clean_site_url, year_folder_path)
 
-    # 1. File Upload via local named copy
+    folder_url, folder_link_id = resolve_folder_sharing_link(
+        clean_site_url, folder_relative_path, sp_folder, client_email, existing_link_entry
+    )
+
+    existing = existing_link_entry or {}
+    existing_checklist_url = str(existing.get("checklist_url") or "").strip()
+
+    # No ProConnect checklist available for this client: skip Excel upload, keep folder sharing intact
+    if not local_file_path:
+        return folder_relative_path, folder_url, folder_link_id, existing_checklist_url
+
+    # Skip rebuilding/uploading .xlsx if already deployed in sp_links.json (avoids version bumps & preserves client edits)
+    if existing_checklist_url and not force_upload:
+        print(f"  ├─ Skipping .xlsx upload: checklist_url already present in manifest.", file=sys.stderr)
+        return folder_relative_path, folder_url, folder_link_id, existing_checklist_url
+
+    # Upload .xlsx via local named copy
     stage_dir = os.path.dirname(local_file_path)
     staged_file_path = os.path.join(stage_dir, remote_filename)
-    
+
     if os.path.exists(staged_file_path):
         os.remove(staged_file_path)
     os.rename(local_file_path, staged_file_path)
@@ -522,59 +742,31 @@ def process_sharepoint_upload_and_sharing(
         "--path", staged_file_path,
         "--overwrite"
     ]
-    
+
     try:
         subprocess.run(upload_cmd, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as e:
         err_msg = (e.stderr or e.stdout or "").strip()
-        print(f"[M365 UPLOAD ERROR] Failed uploading {remote_filename}: {err_msg}", file=sys.stderr)
-        return None, None
+        print(f"  ├─ [M365 UPLOAD ERROR] Failed uploading {remote_filename}: {err_msg}", file=sys.stderr)
+        return folder_relative_path, folder_url, folder_link_id, existing_checklist_url
     finally:
         if os.path.exists(staged_file_path):
             os.remove(staged_file_path)
 
-    # 2. Obtain Folder Sharing Link via m365 spo folder sharinglink add (Scope: users, with recipients)
-    folder_url = ""
-    if client_email:
-        folder_relative_path = f"/{doc_lib}/{sp_folder}".replace("//", "/")
-        add_link_cmd = [
-            "m365", "spo", "folder", "sharinglink", "add",
-            "--webUrl", clean_site_url,
-            "--folderUrl", folder_relative_path,
-            "--type", "edit",
-            "--scope", "users",
-            "--recipients", client_email,
-            "-o", "json"
-        ]
-        try:
-            res = subprocess.run(add_link_cmd, capture_output=True, text=True, check=True)
-            link_data = json.loads(res.stdout or "{}")
-            if isinstance(link_data, dict):
-                folder_url = link_data.get("link") or link_data.get("Url") or link_data.get("webUrl") or ""
-            elif isinstance(link_data, list) and len(link_data) > 0:
-                folder_url = link_data[0].get("link") or link_data[0].get("Url") or link_data[0].get("webUrl") or ""
-            print(f"  ├─ Created sharing link for folder {sp_folder} (Recipients: {client_email or 'None'})", file=sys.stderr)
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            err_msg = getattr(e, 'stderr', str(e)).strip() if hasattr(e, 'stderr') else str(e)
-            print(f"[M365 SHARING LINK WARNING] Failed creating folder sharing link for {sp_folder}: {err_msg}", file=sys.stderr)
-            folder_url = f"{clean_site_url}/{urllib.parse.quote(base_folder_path)}"
-
-    # 3. Construct Direct Web-Editor Viewing Link for the Excel Checklist
+    # Construct Direct Excel Online Edit Link for the Checklist
     parsed_site = urllib.parse.urlparse(clean_site_url)
     site_path = parsed_site.path.rstrip('/')
-    
-    relative_file_path = f"{site_path}/{year_folder_path}/{remote_filename}".replace("//", "/")
-    relative_parent_path = f"{site_path}/{year_folder_path}".replace("//", "/")
 
-    encoded_id = urllib.parse.quote(relative_file_path)
-    encoded_parent = urllib.parse.quote(relative_parent_path)
+    relative_file_path = f"{site_path}/{year_folder_path}/{remote_filename}".replace("//", "/")
+    encoded_sourcedoc = urllib.parse.quote(relative_file_path, safe="")
+    encoded_filename = urllib.parse.quote(remote_filename, safe="")
 
     checklist_url = (
-        f"{clean_site_url}/{urllib.parse.quote(doc_lib)}/Forms/AllItems.aspx"
-        f"?id={encoded_id}&parent={encoded_parent}"
+        f"{clean_site_url}/_layouts/15/Doc.aspx"
+        f"?sourcedoc={encoded_sourcedoc}&file={encoded_filename}&action=edit&mobileredirect=true"
     )
 
-    return folder_url, checklist_url
+    return folder_relative_path, folder_url, folder_link_id, checklist_url
 
 
 # ==========================================
@@ -607,13 +799,14 @@ def parse_qbosp_csv(qbosp_path: str) -> Dict[str, Dict[str, str]]:
 def main():
     parser = argparse.ArgumentParser(description="Process ProConnect checklists, build Excel files with dropdowns, upload to SharePoint via m365 CLI.")
     parser.add_argument("-q", "--qbosp", default="qbosp.csv", help="Path to qbosp.csv mapping file")
-    parser.add_argument("-o", "--output-json", default="sp_links.json", help="Path for output JSON link mapping")
+    parser.add_argument("-o", "--output-json", default="sp_links.json", help="Path for read-write JSON link state manifest")
     parser.add_argument("-c", "--checklists", default="checklists", help="Directory to stage raw checklist JSON files keyed by QBO ID")
     parser.add_argument("-x", "--xlate", default="", metavar="FILE", help="Path to id_mapping.json to translate production QBO IDs to sandbox QBO IDs when naming checklist JSON files.")
-    parser.add_argument("--site-url", default=SPO_SITE_URL, help="SharePoint Site Web URL")
-    parser.add_argument("--doc-lib", default=SPO_DOC_LIBRARY, help="SharePoint Document Library folder root (default: Shared Documents)")
+    parser.add_argument("--site-url", default=SITE_URL, help="SharePoint Site Web URL")
+    parser.add_argument("--doc-lib", default=DOC_LIBRARY, help="SharePoint Document Library folder root (default: Shared Documents)")
     parser.add_argument("--tax-year", default=TAX_YEAR, help="Tax year parameter for API requests (default: 2026)")
-    parser.add_argument("--cleanup", action="store_true", help="Run in cleanup mode: read JSON output, remove sharing links via CLI, and delete uploaded checklist files.")
+    parser.add_argument("--force-upload", action="store_true", help="Rebuild and overwrite .xlsx on SharePoint even if checklist_url is already present in sp_links.json.")
+    parser.add_argument("--cleanup", action="store_true", help="Run in cleanup mode: revoke script-created sharing links (where folder_link_id is non-null), delete uploaded checklist files, and reset links to null.")
 
     args = parser.parse_args()
 
@@ -624,6 +817,7 @@ def main():
     checklists = args.checklists
     xlate_path = args.xlate
     tax_year = args.tax_year
+    force_upload = args.force_upload
 
     # If --cleanup is passed, execute the backout process and exit
     if args.cleanup:
@@ -631,7 +825,7 @@ def main():
         sys.exit(0)
 
     if not site_url:
-        print("[ERROR] SharePoint site URL is required. Set SPO_SITE_URL env var or pass --site-url.", file=sys.stderr)
+        print("[ERROR] SharePoint site URL is required. Set SITE_URL env var or pass --site-url.", file=sys.stderr)
         sys.exit(1)
 
     headers = parse_curl_headers()
@@ -643,6 +837,11 @@ def main():
     cust_map = id_mapping.get("customers", {})
     if xlate_path:
         print(f"[INFO] Loaded ID mapping from {xlate_path} ({len(cust_map)} customer(s) mapped).", file=sys.stderr)
+
+    # Load existing sp_links.json as a read-write state manifest
+    sharepoint_links = load_links_manifest(out_json_path)
+    if sharepoint_links:
+        print(f"[INFO] Loaded {len(sharepoint_links)} existing link entry/entries from {out_json_path}.", file=sys.stderr)
 
     qbo_meta = get_qbo_customer_metadata()
     qbosp_customers = parse_qbosp_csv(qbosp_path)
@@ -661,7 +860,6 @@ def main():
             returns_by_client_id[str(ret['id_client'])] = ret
 
     os.makedirs(checklists, exist_ok=True)
-    sharepoint_links = {}
     processed_count = 0
 
     print("\n[INFO] Starting checklist extraction, local JSON staging, Excel creation, and SharePoint upload loop...\n", file=sys.stderr)
@@ -674,80 +872,96 @@ def main():
         target_qbo_id = str(cust_map.get(prod_qbo_id, prod_qbo_id))
 
         meta = qbo_meta.get(prod_qbo_id, {})
-        proconnect_id = meta.get("client_entity_id")
+        proconnect_id = meta.get("client_entity_id", "")
         client_email = meta.get("email", "")
 
-        if not proconnect_id:
-            print(f"[-] Skipping QBO ID {prod_qbo_id} ({c_name}): No matching ProConnect ClientEntityId found in QBO.", file=sys.stderr)
-            continue
-
-        ret_data = returns_by_client_id.get(proconnect_id)
+        ret_data = returns_by_client_id.get(proconnect_id) if proconnect_id else None
         return_name = ret_data.get('name') if ret_data else f'{tax_year} Tax Return'
 
-        # Fetch ProConnect Checklist safely
-        checklist_url_api = f"{DOC_URL}/v1/doc-checklist/{proconnect_id}?currentYear={tax_year}"
-        checklist_data = fetch_intuit_json(checklist_url_api, headers)
-        
-        if not checklist_data:
-            print(f"[-] Warning: No checklist data returned for {c_name} (ProConnect ID: {proconnect_id}). Skipping...", file=sys.stderr)
-            continue
+        # Fetch ProConnect Checklist safely (404 means no checklist exists yet for this client/year)
+        checklist_data = None
+        if proconnect_id:
+            checklist_url_api = f"{DOC_URL}/v1/doc-checklist/{proconnect_id}?currentYear={tax_year}"
+            checklist_data = fetch_intuit_json(checklist_url_api, headers, allow_404=True)
+            if not checklist_data:
+                print(f"[INFO] No ProConnect checklist found for {c_name} (QBO ID: {prod_qbo_id}, ProConnect ID: {proconnect_id}) for {tax_year}; continuing without checklist...", file=sys.stderr)
+        else:
+            print(f"[INFO] No ProConnect ClientEntityId found in QBO for {c_name} (QBO ID: {prod_qbo_id}); continuing without checklist...", file=sys.stderr)
 
-        payload = {
-            "client_id": proconnect_id,
-            "client_name": c_name,
-            "return_name": return_name,
-            "checklist": checklist_data
-        }
+        has_checklist = bool(checklist_data)
+        payload = None
+        staged_json_path: Optional[str] = None
 
-        # Stage raw checklist JSON locally for batch packet PDF generation (using translated Sandbox ID when --xlate is set)
-        staged_json_path = os.path.join(checklists, f"{target_qbo_id}.json")
-        try:
-            with open(staged_json_path, "w", encoding="utf-8") as jf:
-                json.dump(payload, jf, indent=2)
-        except Exception as je:
-            print(f"[-] Warning: Failed staging checklist JSON to {staged_json_path}: {je}", file=sys.stderr)
+        if has_checklist:
+            payload = {
+                "client_id": proconnect_id,
+                "client_name": c_name,
+                "return_name": return_name,
+                "checklist": checklist_data
+            }
+
+            # Stage raw checklist JSON locally only when ProConnect returned checklist data
+            staged_json_path = os.path.join(checklists, f"{target_qbo_id}.json")
+            try:
+                with open(staged_json_path, "w", encoding="utf-8") as jf:
+                    json.dump(payload, jf, indent=2)
+            except Exception as je:
+                print(f"[-] Warning: Failed staging checklist JSON to {staged_json_path}: {je}", file=sys.stderr)
+                staged_json_path = None
 
         if not sp_folder:
             id_label = f"Prod ID: {prod_qbo_id} -> Sandbox ID: {target_qbo_id}" if target_qbo_id != prod_qbo_id else f"QBO ID: {prod_qbo_id}"
-            print(f"[-] No sp_folder for [{c_name}] ({id_label}). Staged JSON to {staged_json_path}. Continue...", file=sys.stderr)
+            staged_note = f"Staged JSON to {staged_json_path}." if staged_json_path else "No checklist staged."
+            print(f"[INFO] No sp_folder for [{c_name}] ({id_label}). {staged_note} Continue...", file=sys.stderr)
             continue
 
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_file:
-            tmp_xlsx_path = tmp_file.name
+        existing_entry = sharepoint_links.get(prod_qbo_id) or {}
+        existing_checklist_url = str(existing_entry.get("checklist_url") or "").strip()
 
-        try:
+        processed_count += 1
+        id_label = f"Prod ID: {prod_qbo_id} -> Sandbox ID: {target_qbo_id}" if target_qbo_id != prod_qbo_id else f"QBO ID: {prod_qbo_id}"
+        print(f"[{processed_count}] Processing [{c_name}] ({id_label}) -> Folder: '{sp_folder}/{tax_year}'...", file=sys.stderr)
+
+        tmp_xlsx_path: Optional[str] = None
+        if has_checklist and payload and (not existing_checklist_url or force_upload):
+            with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_file:
+                tmp_xlsx_path = tmp_file.name
             build_excel_workbook(payload, tmp_xlsx_path)
 
-            target_filename = f"Tax_Checklist_{prod_qbo_id}.xlsx"
-            processed_count += 1
-            id_label = f"Prod ID: {prod_qbo_id} -> Sandbox ID: {target_qbo_id}" if target_qbo_id != prod_qbo_id else f"QBO ID: {prod_qbo_id}"
-            print(f"[{processed_count}] Processing [{c_name}] ({id_label}) -> Folder: '{sp_folder}/{tax_year}'...", file=sys.stderr)
-            
-            folder_url, checklist_url = process_sharepoint_upload_and_sharing(
-                site_url, doc_lib, sp_folder, tax_year, client_email, tmp_xlsx_path, target_filename
+        try:
+            target_filename = "Tax Checklist.xlsx"
+            folder_path, folder_url, folder_link_id, checklist_url = process_sharepoint_folder_and_checklist(
+                site_url,
+                doc_lib,
+                sp_folder,
+                tax_year,
+                client_email,
+                tmp_xlsx_path,
+                target_filename,
+                existing_entry,
+                force_upload=force_upload
             )
 
-            if checklist_url:
-                sharepoint_links[prod_qbo_id] = {
-                    "folder_url": folder_url or "",
-                    "checklist_url": checklist_url
-                }
-                print(f"  ├─ Staged JSON  : {staged_json_path}", file=sys.stderr)
-                print(f"  ├─ Folder URL   : {folder_url}", file=sys.stderr)
-                print(f"  └─ Checklist URL: {checklist_url}", file=sys.stderr)
-            else:
-                print(f"  └─ Warning: Processed but failed retrieving checklist web link for QBO ID {prod_qbo_id}", file=sys.stderr)
+            sharepoint_links[prod_qbo_id] = {
+                "folder_path": folder_path or "",
+                "folder_url": folder_url,
+                "folder_link_id": folder_link_id,
+                "checklist_url": checklist_url
+            }
+            save_links_manifest(out_json_path, sharepoint_links)
+            print(f"  ├─ Staged JSON   : {staged_json_path or '[None - no checklist]'}", file=sys.stderr)
+            print(f"  ├─ Folder Path   : {folder_path}", file=sys.stderr)
+            print(f"  ├─ Folder URL    : {folder_url or '[null / Not generated]'}", file=sys.stderr)
+            print(f"  ├─ Folder Link ID: {folder_link_id or 'null'}", file=sys.stderr)
+            print(f"  └─ Checklist URL : {checklist_url or '[None - no checklist]'}", file=sys.stderr)
 
         finally:
-            if os.path.exists(tmp_xlsx_path):
+            if tmp_xlsx_path and os.path.exists(tmp_xlsx_path):
                 os.remove(tmp_xlsx_path)
 
         time.sleep(0.1)
 
-    with open(out_json_path, "w", encoding="utf-8") as f:
-        json.dump(sharepoint_links, f, indent=2)
-
-    print(f"\n[SUCCESS] Execution complete! Successfully processed {processed_count} checklist(s).", file=sys.stderr)
+    print(f"\n[SUCCESS] Execution complete! Successfully processed {processed_count} client(s).", file=sys.stderr)
     print(f"  - Staged checklist JSONs in : {checklists}", file=sys.stderr)
     print(f"  - Keyed output JSON saved to: {out_json_path}", file=sys.stderr)
 
