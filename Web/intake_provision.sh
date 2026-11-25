@@ -167,13 +167,13 @@ if [ "$SANDBOX" ]; then
 	SHARE_SITE="${TENANT_URL}"
 	EMAIL_FROM="dianna@tarrantadvisors.com"
 	NOTIFY="glmck13@gmail.com"
-        SP_LINKS_FILE="${DOCUMENT_ROOT}/etc/sp_links_sandbox.json"
+	SP_LINKS_FILE="${DOCUMENT_ROOT}/etc/sp_links_sandbox.json"
 else
 	COMPANY_SITE="${TENANT_URL}/sites/Company"
 	SHARE_SITE="${TENANT_URL}/sites/TarrantAdvisorsShare"
 	EMAIL_FROM="dianna@tarrantadvisors.com"
 	NOTIFY="katie@tarrantadvisors.com,steve@tarrantadvisors.com,stephen@tarrantadvisors.com"
-        SP_LINKS_FILE="${DOCUMENT_ROOT}/etc/sp_links.json"
+	SP_LINKS_FILE="${DOCUMENT_ROOT}/etc/sp_links.json"
 fi
 
 SHARED_FOLDERS=("Prior to 2026" "2026" "Tax Returns")
