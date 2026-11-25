@@ -47,6 +47,7 @@ if PIPELINE_SANDBOX:
     CARBON_COPIES = []
     DRAFTS_DIR = os.environ.get("DOCUMENT_ROOT", ".") + "/sandbox-engagements"
     CHECKLISTS_DIR = os.environ.get("DOCUMENT_ROOT", ".") + "/sandbox-checklists"
+    SP_LINKS_FILE = os.environ.get("DOCUMENT_ROOT", ".") + "/etc/sp_links_sandbox.json"
 else:
     ENABLE_BATCH_MODE = True
     JS_FILE = "engagement_pipeline.js"
@@ -60,6 +61,7 @@ else:
     CARBON_COPIES = ["katie@tarrantadvisors.com"]
     DRAFTS_DIR = os.environ.get("DOCUMENT_ROOT", ".") + "/engagements"
     CHECKLISTS_DIR = os.environ.get("DOCUMENT_ROOT", ".") + "/checklists"
+    SP_LINKS_FILE = os.environ.get("DOCUMENT_ROOT", ".") + "/etc/sp_links.json"
 
 
 COMPANY_NAME = "Tarrant Advisors LLC"
@@ -333,6 +335,19 @@ def load_exposed_services_from_template():
 
 EXPOSED_SERVICES = load_exposed_services_from_template()
 
+def load_sharepoint_manifest():
+    if not os.path.exists(SP_LINKS_FILE):
+        return {}
+    try:
+        with open(SP_LINKS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as ex:
+        print(f"DEBUG: Failed reading SharePoint manifest {SP_LINKS_FILE}: {str(ex)}", file=sys.stderr)
+        return {}
+
+SP_LINKS_MAP = load_sharepoint_manifest()
+
 def resolve_service_line_item(item_id, svc, notes_val):
     clean_svc = (svc or "").strip()
     clean_item_id = str(item_id or "").strip()
@@ -365,19 +380,37 @@ def resolve_service_line_item(item_id, svc, notes_val):
 
     return clean_item_id, clean_svc, notes_val
 
-def extract_sharepoint_links_from_draft(draft_data):
-    """Extracts SharePoint URLs directly from draft JSON metadata without string scanning."""
-    if not draft_data or not isinstance(draft_data, dict):
-        return "", "", "", False
+def resolve_sharepoint_links(qbo_id, existing_sp=None, form=None):
+    """Resolves SharePoint links from existing draft/form state, falling back to SP_LINKS_MAP."""
+    sp = existing_sp if isinstance(existing_sp, dict) else {}
+    folder_url = str(sp.get("folder_url") or (get_form_val(form, "sharepoint_folder_url", "") if form else "")).strip()
+    checklist_url = str(sp.get("checklist_url") or (get_form_val(form, "sharepoint_checklist_url", "") if form else "")).strip()
+    schedule_ce_url = str(sp.get("schedule_ce_url") or (get_form_val(form, "sharepoint_schedule_ce_url", "") if form else "")).strip()
 
-    sp_meta = draft_data.get("sharepoint", {})
-    if not isinstance(sp_meta, dict):
-        sp_meta = {}
+    if qbo_id and (not folder_url or not checklist_url or not schedule_ce_url):
+        entry = SP_LINKS_MAP.get(str(qbo_id))
+        if isinstance(entry, dict):
+            if not folder_url:
+                folder_url = str(entry.get("folder_url") or "").strip()
+            if not checklist_url:
+                checklist_url = str(entry.get("checklist_url") or "").strip()
+            if not schedule_ce_url:
+                schedule_ce_url = str(entry.get("schedule_ce_url") or "").strip()
 
-    folder_url = sp_meta.get("folder_url", "").strip()
-    checklist_url = sp_meta.get("checklist_url", "").strip()
-    schedule_ce_url = sp_meta.get("schedule_ce_url", "").strip()
+    return {
+        "folder_url": folder_url,
+        "checklist_url": checklist_url,
+        "schedule_ce_url": schedule_ce_url
+    }
 
+def extract_sharepoint_links_from_draft(draft_data, qbo_id=None):
+    """Extracts SharePoint URLs directly from draft JSON metadata, falling back to SP_LINKS_MAP."""
+    sp_meta = draft_data.get("sharepoint", {}) if isinstance(draft_data, dict) else {}
+    resolved = resolve_sharepoint_links(qbo_id, existing_sp=sp_meta)
+
+    folder_url = resolved["folder_url"]
+    checklist_url = resolved["checklist_url"]
+    schedule_ce_url = resolved["schedule_ce_url"]
     has_schedule_ce = bool(schedule_ce_url)
 
     return folder_url, checklist_url, schedule_ce_url, has_schedule_ce
@@ -1415,6 +1448,7 @@ def handle_generate_preview(form):
         try:
             os.makedirs(DRAFTS_DIR, exist_ok=True)
             target_delivery_fmt = get_form_val(form, "delivery_format") or existing_draft.get("delivery_format", "electronic")
+            resolved_sharepoint = resolve_sharepoint_links(client_qbo_id, existing_draft.get("sharepoint"), form)
 
             draft_payload = {
                 "engagement_id": eng_id,
@@ -1441,11 +1475,7 @@ def handle_generate_preview(form):
                     "state": state,
                     "zip": zip_val
                 },
-                "sharepoint": existing_draft.get("sharepoint", {
-                    "folder_url": get_form_val(form, "sharepoint_folder_url", ""),
-                    "checklist_url": get_form_val(form, "sharepoint_checklist_url", ""),
-                    "schedule_ce_url": get_form_val(form, "sharepoint_schedule_ce_url", "")
-                }),
+                "sharepoint": resolved_sharepoint,
                 "out_of_scope_items": posted_oos_dict,
                 "estimate_id": prior_estimate_id,
                 "rows": processed_rows,
@@ -1633,6 +1663,7 @@ def handle_save_draft_only(form):
         "profile_verified": get_form_val(form, "profile_verified", "false").lower() in ["true", "1", "yes"],
         "is_approved": get_form_val(form, "is_approved", "false").lower() in ["true", "1", "yes"] if "is_approved" in form else draft.get("is_approved", False),
         "delivery_format": get_form_val(form, "delivery_format") or draft.get("delivery_format", "electronic"),
+        "sharepoint": resolve_sharepoint_links(client_qbo_id, draft.get("sharepoint"), form),
         "out_of_scope_items": extract_out_of_scope_dict(form, draft.get("out_of_scope_items")),
         "rows": parsed_rows if parsed_rows else draft.get("rows", [])
     })
@@ -1761,11 +1792,7 @@ def handle_patch_draft_only(form):
             draft["co_signer"]["email"] = c_email
 
         # Preserve sharepoint block
-        draft["sharepoint"] = draft.get("sharepoint", {
-            "folder_url": get_form_val(form, "sharepoint_folder_url", ""),
-            "checklist_url": get_form_val(form, "sharepoint_checklist_url", ""),
-            "schedule_ce_url": get_form_val(form, "sharepoint_schedule_ce_url", "")
-        })
+        draft["sharepoint"] = resolve_sharepoint_links(client_qbo_id, draft.get("sharepoint"), form)
 
         # Patch line item rows ONLY if row parameters were explicitly posted
         if "selected_rows" in form or any(k.startswith("row_item_id_") or k.startswith("row_service_") for k in form):
@@ -1840,7 +1867,7 @@ def handle_email_welcome_letter_only(form):
     client_address_str = ", ".join(address_parts) if address_parts else ""
 
     # Extract SharePoint and Questionnaire URLs
-    sp_folder_url, sp_checklist_url, sp_schedule_ce_url, has_schedule_ce = extract_sharepoint_links_from_draft(draft_data)
+    sp_folder_url, sp_checklist_url, sp_schedule_ce_url, has_schedule_ce = extract_sharepoint_links_from_draft(draft_data, qbo_id=client_qbo_id)
     questionnaire_form_url = generate_questionnaire_url(client_qbo_id)
 
     # 3. Base64 Encode Header Logo Image for Inline Email Display
@@ -2183,7 +2210,7 @@ def build_engagement_story(form, include_esign_tags=False, include_cover_letter=
         except Exception:
             pass
 
-    sp_folder_url, sp_checklist_url, _, _ = extract_sharepoint_links_from_draft(draft_data)
+    sp_folder_url, sp_checklist_url, _, _ = extract_sharepoint_links_from_draft(draft_data, qbo_id=c_id)
 
     # Generate pre-filled, check-digit-protected Microsoft Form Questionnaire URL
     questionnaire_form_url = generate_questionnaire_url(c_id)
