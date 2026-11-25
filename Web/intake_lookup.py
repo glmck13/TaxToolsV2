@@ -21,6 +21,7 @@ ORGANIZATION_ENTITY_TYPES = {
     "organization",
 }
 
+
 def qbo_api_request(endpoint, method="GET", payload=None):
     """Executes authenticated HTTP requests against QuickBooks Online API."""
     if not QBO_APIBASE or not QBO_REALMID or not QBO_TOKEN:
@@ -33,7 +34,7 @@ def qbo_api_request(endpoint, method="GET", payload=None):
             sql_stmt = query[6:]
             encoded_query = "query=" + urllib.parse.quote(sql_stmt)
         else:
-            encoded_query = urllib.parse.quote(query, safe='=/&')
+            encoded_query = urllib.parse.quote(query, safe="=/&")
         endpoint_url = f"{QBO_APIBASE}/company/{QBO_REALMID}/{path}?{encoded_query}"
     else:
         endpoint_url = f"{QBO_APIBASE}/company/{QBO_REALMID}/{endpoint}"
@@ -41,7 +42,7 @@ def qbo_api_request(endpoint, method="GET", payload=None):
     headers = {
         "Authorization": f"Bearer {QBO_TOKEN}",
         "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     data = json.dumps(payload).encode("utf-8") if payload else None
@@ -49,11 +50,47 @@ def qbo_api_request(endpoint, method="GET", payload=None):
 
     try:
         with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode("utf-8"))
+            res_body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")
         print(f"QBO API HTTP Error [{e.code}]: {error_body}", file=sys.stderr)
         raise Exception(f"QBO API Call Failed (HTTP {e.code}): {error_body}")
+
+    if isinstance(res_body, dict) and res_body.get("Fault"):
+        errors = res_body["Fault"].get("Error", [{}])
+        first_err = errors[0] if errors else {}
+        msg = first_err.get("Message", "Unknown")
+        detail = first_err.get("Detail", "")
+        raise Exception(f"QBO API Fault: {msg} - {detail}")
+
+    return res_body
+
+
+def fetch_all_active_customers(page_size=1000):
+    """Paginates through all active QuickBooks Online Customer records."""
+    all_customers = []
+    start_pos = 1
+
+    while True:
+        sql = (
+            f"select * from Customer where Active = true "
+            f"order by Id startposition {start_pos} maxresults {page_size}"
+        )
+        query_res = qbo_api_request(f"query?query={sql}")
+        batch = query_res.get("QueryResponse", {}).get("Customer", [])
+
+        if not batch:
+            break
+
+        all_customers.extend(batch)
+
+        if len(batch) < page_size:
+            break
+
+        start_pos += page_size
+
+    return all_customers
+
 
 def parse_acct_num(notes_str):
     """Parses JSON-encoded metadata from QBO Notes field into normalized dict."""
@@ -63,7 +100,7 @@ def parse_acct_num(notes_str):
         "friendly_name": "",
         "primary_signer_email": "",
         "co_signer_name": "",
-        "co_signer_email": ""
+        "co_signer_email": "",
     }
     if not notes_str or not notes_str.strip():
         return meta
@@ -83,7 +120,7 @@ def parse_acct_num(notes_str):
                 meta["delivery_format"] = raw_fmt
             else:
                 meta["delivery_format"] = "electronic"
-            
+
             signers = data.get("signers", [])
             if isinstance(signers, list) and len(signers) > 0:
                 p_signer = signers[0] if isinstance(signers[0], dict) else {}
@@ -94,19 +131,19 @@ def parse_acct_num(notes_str):
                     s_signer = signers[1] if isinstance(signers[1], dict) else {}
                     meta["co_signer_name"] = str(s_signer.get("name", "")).strip()
                     meta["co_signer_email"] = str(s_signer.get("email", "")).strip()
-    except Exception as e:
+    except Exception:
         # Non-JSON standard notes stored on QBO client record
         pass
 
     return meta
 
+
 def handle_customer_catalog():
     """Generates and outputs JSON customer catalog for front-end intake lookup."""
     sys.stdout.write("Content-Type: application/json\r\n\r\n")
     try:
-        query_res = qbo_api_request("query?query=select * from Customer where Active=true maxresults 1000")
-        customers = query_res.get("QueryResponse", {}).get("Customer", [])
-        
+        customers = fetch_all_active_customers()
+
         catalog = {}
         for c in customers:
             c_id = str(c.get("Id", ""))
@@ -117,14 +154,14 @@ def handle_customer_catalog():
             email_obj = c.get("PrimaryEmailAddr", {})
 
             meta = parse_acct_num(acct_num)
-            
+
             # Fallback friendly_name to DisplayName if metadata was not present
             if not meta["friendly_name"]:
                 meta["friendly_name"] = c_name
 
             raw_c_email = email_obj.get("Address", "")
             primary_email = raw_c_email.split(",")[0].strip() if raw_c_email else ""
-            
+
             # Format catalog key as "Client Name (ID: 12345)"
             catalog_key = f"{c_name} (ID: {c_id})"
 
@@ -138,13 +175,14 @@ def handle_customer_catalog():
                     "street": addr_obj.get("Line1", ""),
                     "city": addr_obj.get("City", ""),
                     "state": addr_obj.get("CountrySubDivisionCode", ""),
-                    "zip": addr_obj.get("PostalCode", "")
-                }
+                    "zip": addr_obj.get("PostalCode", ""),
+                },
             }
-        
+
         sys.stdout.write(json.dumps({"status": "success", "customers": catalog}))
     except Exception as e:
         sys.stdout.write(json.dumps({"status": "error", "message": str(e)}))
+
 
 if __name__ == "__main__":
     handle_customer_catalog()

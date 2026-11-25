@@ -4,11 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Client Intake & Profile Hub</title>
-    <link rel="stylesheet" href="/css/intake.css?v=2.2">
+    <link rel="stylesheet" href="/css/intake.css?v=2.3">
 </head>
 <body>
 
-<div class="wrapper">
+<div class="wrapper" id="main-wrapper">
     <div class="header-title-bar">
         <h1>Client Intake & Profile Hub <span id="sandbox"></span></h1>
         <div class="header-actions">
@@ -27,6 +27,9 @@
         </button>
         <button type="button" id="btn-mode-deactivate" class="mode-btn" data-mode="deactivate" onclick="setMode('deactivate')">
             🚫 Deactivate Client
+        </button>
+        <button type="button" id="btn-mode-demographics" class="mode-btn" data-mode="demographics" onclick="setMode('demographics')">
+            📊 Client Demographics
         </button>
     </div>
 
@@ -167,6 +170,81 @@
             ⚡ Provision New Client & Folders
         </button>
     </form>
+
+    <!-- CLIENT DEMOGRAPHICS DIRECTORY VIEW -->
+    <div id="demographics-view" class="hidden">
+        <div class="form-section demographics-mode">
+            <div class="section-title-bar">
+                <span class="section-title">📊 Active Client Demographics</span>
+                <div class="demo-header-controls">
+                    <span id="demo-count" class="badge-status demographics">0 Clients</span>
+                    <button type="button" id="btn-export-csv" class="btn-export-csv" onclick="exportDemographicsCSV()">
+                        ⬇️ Export CSV (0)
+                    </button>
+                </div>
+            </div>
+
+            <!-- Search & Filter Bar -->
+            <div class="demo-toolbar">
+                <input 
+                    type="text" 
+                    id="demo-search" 
+                    class="demo-search-input" 
+                    placeholder="Search client, contact, email, phone, or city..." 
+                    oninput="renderDemographicsTable()"
+                >
+                <select id="demo-filter-entity" class="demo-filter-select" onchange="renderDemographicsTable()">
+                    <option value="">All Account Types</option>
+                    <option value="individual">Individual / Sole Prop</option>
+                    <option value="sm_llc">Single-Member LLC</option>
+                    <option value="s_corp">S-Corporation</option>
+                    <option value="partnership">Partnership / MM-LLC</option>
+                    <option value="c_corp">C-Corporation</option>
+                    <option value="non_profit">Non-Profit</option>
+                    <option value="trust">Trust / Estate</option>
+                </select>
+                <select id="demo-filter-format" class="demo-filter-select" onchange="renderDemographicsTable()">
+                    <option value="">All Formats</option>
+                    <option value="electronic">Electronic</option>
+                    <option value="paper">Paper</option>
+                </select>
+            </div>
+
+            <!-- Sortable Master Table + Expandable Drawers -->
+            <div class="demo-table-container">
+                <table id="demographics-table" class="demo-table">
+                    <thead>
+                        <tr>
+                            <th class="sortable" data-sort="display_name" onclick="sortDemographics('display_name')">
+                                Client Name <span class="sort-indicator">▲</span>
+                            </th>
+                            <th class="sortable" data-sort="friendly_name" onclick="sortDemographics('friendly_name')">
+                                Contact Name <span class="sort-indicator"></span>
+                            </th>
+                            <th class="sortable" data-sort="entity_type" onclick="sortDemographics('entity_type')">
+                                Account Type <span class="sort-indicator"></span>
+                            </th>
+                            <th class="sortable" data-sort="delivery_format" onclick="sortDemographics('delivery_format')">
+                                Format <span class="sort-indicator"></span>
+                            </th>
+                            <th class="sortable" data-sort="email" onclick="sortDemographics('email')">
+                                Email <span class="sort-indicator"></span>
+                            </th>
+                            <th class="sortable" data-sort="phone" onclick="sortDemographics('phone')">
+                                Phone <span class="sort-indicator"></span>
+                            </th>
+                            <th class="col-actions">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="demographics-tbody">
+                        <tr>
+                            <td colspan="7" class="demo-empty-state">Loading active QBO client roster...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
 </div>
 
 <!-- SAFETY DEACTIVATION CONFIRMATION MODAL -->
@@ -197,6 +275,6 @@
     </div>
 </div>
 
-<script src="/js/intake.js?v=2.2"></script>
+<script src="/js/intake.js?v=2.3"></script>
 </body>
 </html>

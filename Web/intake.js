@@ -3,7 +3,23 @@
    ========================================================================== */
 
 let customerCatalog = {};
-let currentMode = "lead"; // Modes: "lead", "heal", "deactivate"
+let currentMode = "lead"; // Modes: "lead", "heal", "deactivate", "demographics"
+
+// Demographics directory state
+let demoSortField = "display_name";
+let demoSortDir = "asc";
+let expandedDrawerIds = new Set();
+
+const ENTITY_LABELS = {
+    individual: "Individual / Sole Prop",
+    sm_llc: "Single-Member LLC",
+    s_corp: "S-Corporation",
+    partnership: "Partnership / MM-LLC",
+    c_corp: "C-Corporation",
+    non_profit: "Non-Profit",
+    trust: "Trust / Estate",
+    organization: "Organization"
+};
 
 // Environment detection
 const urlParams = new URLSearchParams(window.location.search);
@@ -39,6 +55,19 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 /**
+ * Escape HTML special characters for safe DOM rendering
+ */
+function escapeHtml(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+/**
  * Fetch QBO customer catalog from intake_lookup.cgi
  */
 async function loadCustomerCatalog() {
@@ -50,11 +79,16 @@ async function loadCustomerCatalog() {
         if (data.status === "success" && data.customers) {
             customerCatalog = data.customers;
             populateDatalist();
+            renderDemographicsTable();
         } else {
             console.warn("Could not load customer catalog:", data.message);
         }
     } catch (err) {
         console.error("Error fetching QBO catalog:", err);
+        const tbody = document.getElementById("demographics-tbody");
+        if (tbody) {
+            tbody.innerHTML = `<tr><td colspan="7" class="demo-empty-state">Error loading QBO customer roster. Check server logs.</td></tr>`;
+        }
     }
 }
 
@@ -99,22 +133,43 @@ function setFieldsReadOnly(isReadOnly) {
 }
 
 /**
- * Switch mode between "lead" (New Lead), "heal" (Existing Client), and "deactivate" (Archive Client)
- * @param {string} mode - Target mode ("lead", "heal", "deactivate")
+ * Switch mode between "lead", "heal", "deactivate", and "demographics"
+ * @param {string} mode - Target mode ("lead", "heal", "deactivate", "demographics")
  * @param {boolean} preserveData - If true, keeps existing form values intact (used when cloning a client)
  */
 function setMode(mode, preserveData = false) {
     currentMode = mode;
 
+    const wrapperEl = document.getElementById("main-wrapper");
     const btnLead = document.getElementById("btn-mode-lead");
     const btnHeal = document.getElementById("btn-mode-heal");
     const btnDeactivate = document.getElementById("btn-mode-deactivate");
+    const btnDemographics = document.getElementById("btn-mode-demographics");
     const submitBtn = document.getElementById("btn-submit");
     const clientInput = document.getElementById("client-select-input");
     const notesSection = document.getElementById("section-notes");
-    const formSections = document.querySelectorAll(".form-section");
+    const formSections = document.querySelectorAll("#intake-form .form-section");
     const badge = document.getElementById("client-lead-badge");
     const formEl = document.getElementById("intake-form");
+    const demoView = document.getElementById("demographics-view");
+
+    // Reset tab button active states
+    [btnLead, btnHeal, btnDeactivate, btnDemographics].forEach(btn => btn && btn.classList.remove("active"));
+
+    // Handle Demographics directory tab separately from the intake form
+    if (mode === "demographics") {
+        if (btnDemographics) btnDemographics.classList.add("active");
+        if (formEl) formEl.classList.add("hidden");
+        if (demoView) demoView.classList.remove("hidden");
+        if (wrapperEl) wrapperEl.classList.add("demographics-wide");
+        renderDemographicsTable();
+        return;
+    }
+
+    // Restore intake form visibility and standard width for form modes
+    if (formEl) formEl.classList.remove("hidden");
+    if (demoView) demoView.classList.add("hidden");
+    if (wrapperEl) wrapperEl.classList.remove("demographics-wide");
 
     // 1. Reset form fields unless preserving cloned data
     if (!preserveData) {
@@ -127,8 +182,6 @@ function setMode(mode, preserveData = false) {
         }
     }
 
-    // Reset tab button active states & section classes
-    [btnLead, btnHeal, btnDeactivate].forEach(btn => btn && btn.classList.remove("active"));
     formSections.forEach(section => section.classList.remove("heal-mode", "deactivate-mode"));
 
     if (submitBtn) submitBtn.disabled = false;
@@ -195,6 +248,311 @@ function setMode(mode, preserveData = false) {
         }
     }
 }
+
+/* ==========================================================================
+   CLIENT DEMOGRAPHICS DIRECTORY LOGIC
+   ========================================================================== */
+
+/**
+ * Filter and sort customerCatalog entries based on active toolbar controls
+ */
+function getFilteredDemographics() {
+    const searchVal = (document.getElementById("demo-search")?.value || "").trim().toLowerCase();
+    const entityFilter = document.getElementById("demo-filter-entity")?.value || "";
+    const formatFilter = document.getElementById("demo-filter-format")?.value || "";
+
+    const rows = Object.entries(customerCatalog).map(([catalogKey, client]) => {
+        const meta = client.metadata || {};
+        const addr = client.address || {};
+        return {
+            catalogKey,
+            id: String(client.id || ""),
+            display_name: client.display_name || "",
+            friendly_name: meta.friendly_name || "",
+            email: client.email || "",
+            phone: client.phone || "",
+            co_signer_name: meta.co_signer_name || "",
+            co_signer_email: meta.co_signer_email || "",
+            entity_type: meta.entity_type || "individual",
+            delivery_format: meta.delivery_format || "electronic",
+            street: addr.street || "",
+            city: addr.city || "",
+            state: addr.state || "",
+            zip: addr.zip || ""
+        };
+    });
+
+    const filtered = rows.filter(row => {
+        if (entityFilter && row.entity_type !== entityFilter) return false;
+        if (formatFilter && row.delivery_format !== formatFilter) return false;
+
+        if (searchVal) {
+            const haystack = [
+                row.id,
+                row.display_name,
+                row.friendly_name,
+                row.email,
+                row.phone,
+                row.co_signer_name,
+                row.co_signer_email,
+                row.city,
+                row.state
+            ].join(" ").toLowerCase();
+
+            if (!haystack.includes(searchVal)) return false;
+        }
+        return true;
+    });
+
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+    filtered.sort((a, b) => {
+        const valA = String(a[demoSortField] || "");
+        const valB = String(b[demoSortField] || "");
+        const cmp = collator.compare(valA, valB);
+        return demoSortDir === "asc" ? cmp : -cmp;
+    });
+
+    return filtered;
+}
+
+/**
+ * Toggle sort field and direction for Demographics table
+ */
+function sortDemographics(field) {
+    if (demoSortField === field) {
+        demoSortDir = demoSortDir === "asc" ? "desc" : "asc";
+    } else {
+        demoSortField = field;
+        demoSortDir = "asc";
+    }
+
+    // Update header sort indicators
+    document.querySelectorAll("#demographics-table thead th.sortable").forEach(th => {
+        const indicator = th.querySelector(".sort-indicator");
+        if (!indicator) return;
+        if (th.dataset.sort === demoSortField) {
+            indicator.textContent = demoSortDir === "asc" ? "▲" : "▼";
+        } else {
+            indicator.textContent = "";
+        }
+    });
+
+    renderDemographicsTable();
+}
+
+/**
+ * Render master rows and expandable client detail drawers
+ */
+function renderDemographicsTable() {
+    const tbody = document.getElementById("demographics-tbody");
+    const countBadge = document.getElementById("demo-count");
+    const exportBtn = document.getElementById("btn-export-csv");
+    if (!tbody) return;
+
+    const rows = getFilteredDemographics();
+    const totalCount = Object.keys(customerCatalog).length;
+
+    if (countBadge) {
+        countBadge.textContent = rows.length === totalCount
+            ? `${totalCount} Clients`
+            : `${rows.length} of ${totalCount} Clients`;
+    }
+
+    if (exportBtn) {
+        exportBtn.textContent = `⬇️ Export CSV (${rows.length})`;
+    }
+
+    if (rows.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" class="demo-empty-state">No active clients match the current filters.</td></tr>`;
+        return;
+    }
+
+    const htmlChunks = [];
+
+    rows.forEach(row => {
+        const isExpanded = expandedDrawerIds.has(row.id);
+        const entityLabel = ENTITY_LABELS[row.entity_type] || row.entity_type;
+        const isPaper = row.delivery_format === "paper";
+        const formatLabel = isPaper ? "Paper" : "Electronic";
+        const formatClass = isPaper ? "format-paper" : "format-electronic";
+
+        const emailHtml = row.email
+            ? `<a href="mailto:${escapeHtml(row.email)}" class="demo-email-link" onclick="event.stopPropagation()">${escapeHtml(row.email)}</a>`
+            : `<span class="demo-muted">—</span>`;
+
+        const phoneHtml = row.phone
+            ? escapeHtml(row.phone)
+            : `<span class="demo-muted">—</span>`;
+
+        const contactHtml = row.friendly_name
+            ? escapeHtml(row.friendly_name)
+            : `<span class="demo-muted">—</span>`;
+
+        // Master Row
+        htmlChunks.push(`
+            <tr class="demo-row ${isExpanded ? "expanded" : ""}" data-client-id="${escapeHtml(row.id)}" onclick="toggleDemographicsDrawer('${escapeHtml(row.id)}')">
+                <td>
+                    <span class="demo-client-name">${escapeHtml(row.display_name)}</span>
+                    <span class="demo-id-pill">#${escapeHtml(row.id)}</span>
+                </td>
+                <td>${contactHtml}</td>
+                <td><span class="demo-pill entity">${escapeHtml(entityLabel)}</span></td>
+                <td><span class="demo-pill ${formatClass}">${formatLabel}</span></td>
+                <td>${emailHtml}</td>
+                <td>${phoneHtml}</td>
+                <td class="col-actions">
+                    <div class="demo-actions-cell">
+                        <button type="button" class="btn-row-edit" data-catalog-key="${escapeHtml(row.catalogKey)}" onclick="editClientFromDemographics(event, this)">
+                            Edit
+                        </button>
+                        <span class="demo-chevron">${isExpanded ? "▼" : "▶"}</span>
+                    </div>
+                </td>
+            </tr>
+        `);
+
+        // Expandable Detail Drawer Row
+        if (isExpanded) {
+            const coSignerParts = [];
+            if (row.co_signer_name) coSignerParts.push(escapeHtml(row.co_signer_name));
+            if (row.co_signer_email) {
+                coSignerParts.push(`<a href="mailto:${escapeHtml(row.co_signer_email)}" class="demo-email-link">${escapeHtml(row.co_signer_email)}</a>`);
+            }
+            const coSignerDisplay = coSignerParts.length > 0
+                ? coSignerParts.join(" &bull; ")
+                : `<span class="demo-muted">None on file</span>`;
+
+            const cityStateZip = [row.city, row.state].filter(Boolean).join(", ") + (row.zip ? ` ${row.zip}` : "");
+            const addressParts = [row.street, cityStateZip.trim()].filter(Boolean).map(escapeHtml);
+            const addressDisplay = addressParts.length > 0
+                ? addressParts.join("<br>")
+                : `<span class="demo-muted">No billing address on file</span>`;
+
+            htmlChunks.push(`
+                <tr class="demo-drawer-row">
+                    <td colspan="7">
+                        <div class="demo-drawer-card">
+                            <div class="demo-drawer-grid">
+                                <div class="demo-detail-item">
+                                    <span class="demo-detail-label">Additional Signer (Spouse / Partner)</span>
+                                    <span class="demo-detail-value">${coSignerDisplay}</span>
+                                </div>
+                                <div class="demo-detail-item">
+                                    <span class="demo-detail-label">Billing Address</span>
+                                    <span class="demo-detail-value">${addressDisplay}</span>
+                                </div>
+                                <div class="demo-detail-item">
+                                    <span class="demo-detail-label">QuickBooks Online Record</span>
+                                    <span class="demo-detail-value">Customer ID: <strong>${escapeHtml(row.id)}</strong></span>
+                                </div>
+                            </div>
+                        </div>
+                    </td>
+                </tr>
+            `);
+        }
+    });
+
+    tbody.innerHTML = htmlChunks.join("");
+}
+
+/**
+ * Toggle inline detail drawer for a given QBO client ID
+ */
+function toggleDemographicsDrawer(clientId) {
+    if (!clientId) return;
+    if (expandedDrawerIds.has(clientId)) {
+        expandedDrawerIds.delete(clientId);
+    } else {
+        expandedDrawerIds.add(clientId);
+    }
+    renderDemographicsTable();
+}
+
+/**
+ * Jump directly to "Update Existing QBO Client" tab pre-populated with selected client
+ */
+function editClientFromDemographics(event, btnEl) {
+    event.stopPropagation();
+    const catalogKey = btnEl.getAttribute("data-catalog-key");
+    if (!catalogKey || !customerCatalog[catalogKey]) return;
+
+    setMode("heal");
+    fillClientFields(customerCatalog[catalogKey], catalogKey);
+
+    const wrapperEl = document.getElementById("main-wrapper");
+    if (wrapperEl) {
+        wrapperEl.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+}
+
+/**
+ * Export currently filtered demographics rows as a colon-delimited CSV file
+ * Matches column order & sanitization of export_qbo_demographics.sh
+ */
+function exportDemographicsCSV() {
+    const rows = getFilteredDemographics();
+
+    const cleanField = (val) => {
+        if (val === null || val === undefined) return "";
+        return String(val)
+            .replace(/[\r\n]+/g, " ")
+            .replace(/:/g, ";")
+            .trim();
+    };
+
+    const header = [
+        "qbo_id",
+        "client_name",
+        "friendly_name",
+        "primary_email",
+        "phone_number",
+        "co_signer_name",
+        "co_signer_email",
+        "entity_type",
+        "delivery_format",
+        "street",
+        "city",
+        "state",
+        "zip"
+    ].join(":");
+
+    const lines = rows.map(r => [
+        r.id,
+        r.display_name,
+        r.friendly_name,
+        r.email,
+        r.phone,
+        r.co_signer_name,
+        r.co_signer_email,
+        r.entity_type,
+        r.delivery_format,
+        r.street,
+        r.city,
+        r.state,
+        r.zip
+    ].map(cleanField).join(":"));
+
+    const csvContent = [header, ...lines].join("\n") + "\n";
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+
+    const dateStr = new Date().toISOString().split("T")[0];
+    const envSuffix = isSandbox ? "_sandbox" : "";
+    const filename = `qbo_demographics${envSuffix}_${dateStr}.csv`;
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+}
+
+/* ==========================================================================
+   INTAKE / UPDATE / DEACTIVATE FORM LOGIC
+   ========================================================================== */
 
 /**
  * Handle typing/selecting in the Client Name input
@@ -362,7 +720,7 @@ function handleFormSubmit(event) {
         const confirmTextEl = document.getElementById("confirm-modal-text");
 
         if (confirmTextEl) {
-            confirmTextEl.innerHTML = `Are you sure you want to set <strong>${clientName}</strong> to inactive in QBO and move their folders to <strong>!Inactive Clients</strong>?`;
+            confirmTextEl.innerHTML = `Are you sure you want to set <strong>${escapeHtml(clientName)}</strong> to inactive in QBO and move their folders to <strong>!Inactive Clients</strong>?`;
         }
 
         const modal = document.getElementById("confirm-modal-overlay");

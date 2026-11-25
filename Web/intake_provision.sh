@@ -177,7 +177,7 @@ else
 fi
 
 SHARED_FOLDERS=("Prior to 2026" "2026" "Tax Returns")
-COMPANY_FOLDERS=("2025 - Not Prepared by TA" "2026" "2026/Agreements & Invoices" "2026/BU Detail")
+COMPANY_FOLDERS=("2025 - Not Prepared by TA" "2026" "2026/Agreements & Invoices" "2026/BU Detail" "2026/BU Detail/BU - Used" "2026/BU Detail/BU - Not used or duplicate")
 
 # ==============================================================================
 # QUICKBOOKS ONLINE CUSTOMER LOOKUP
