@@ -132,6 +132,12 @@ DELIVERY_FORMAT="${DELIVERY_FORMAT:-electronic}"
 IS_NEW_LEAD="${IS_NEW_LEAD:-true}"
 QBOSP_FILE="${DOCUMENT_ROOT}/etc/${QBO_SANDBOX}qbosp.csv"
 
+if [ -n "$SANDBOX" ]; then
+    SP_LINKS_FILE="${DOCUMENT_ROOT}/etc/sp_links_sandbox.json"
+else
+    SP_LINKS_FILE="${DOCUMENT_ROOT}/etc/sp_links.json"
+fi
+
 # Derive ACTION fallback if not explicitly provided
 if [ -z "$ACTION" ]; then
     if [ "$IS_NEW_LEAD" = "true" ]; then
@@ -544,6 +550,48 @@ rm -f "$HTML_TEMP_FILE"
 if [ -n "$QBO_CUSTOMER_ID" ] && [ "$QBO_CUSTOMER_ID" != "Unknown" ]; then
     echo "${QBO_CUSTOMER_ID}:${CLEAN_CLIENT_NAME}:${CLEAN_CLIENT_NAME} - SHARED:::" >> "$QBOSP_FILE"
     debug "Appended $QBO_CUSTOMER_ID to $QBOSP_FILE"
+
+    # CREATE SHAREPOINT SHARING LINK & ADD TO sp_links.json
+    FOLDER_REL_PATH="/${SHARE_LIB_PATH#/}"
+    FOLDER_URL=""
+    FOLDER_LINK_ID=""
+
+    RECIPIENT_EMAILS=$(jq -nr \
+      --arg p "$CLIENT_EMAIL" \
+      --arg c "$CO_SIGNER_EMAIL" \
+      '[$p, $c] | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | unique_by(ascii_downcase) | join(",")')
+
+    if [ -n "$RECIPIENT_EMAILS" ]; then
+        debug "Creating SharePoint sharing link on '$FOLDER_REL_PATH' for: $RECIPIENT_EMAILS"
+        LINK_RAW=$(m365 spo folder sharinglink add \
+          --webUrl "${SHARE_SITE%/}" \
+          --folderUrl "$FOLDER_REL_PATH" \
+          --type "edit" \
+          --scope "users" \
+          --recipients "$RECIPIENT_EMAILS" \
+          -o json 2>&1 || true)
+
+        if echo "$LINK_RAW" | jq -e . >/dev/null 2>&1; then
+            FOLDER_URL=$(echo "$LINK_RAW" | jq -r '(if type == "array" then .[0] else . end) | (.link.webUrl // .webUrl // .Url // empty)')
+            FOLDER_LINK_ID=$(echo "$LINK_RAW" | jq -r '(if type == "array" then .[0] else . end) | (.id // empty)')
+        else
+            debug "WARNING: m365 sharinglink add failed for '$FOLDER_REL_PATH': $LINK_RAW"
+        fi
+    fi
+
+    jq \
+      --arg id "$QBO_CUSTOMER_ID" \
+      --arg path "$FOLDER_REL_PATH" \
+      --arg url "$FOLDER_URL" \
+      --arg link_id "$FOLDER_LINK_ID" \
+      '.[$id] = {
+        folder_path: $path,
+        folder_url: (if $url != "" then $url else null end),
+        folder_link_id: (if $link_id != "" then $link_id else null end),
+        checklist_url: ""
+      }' "$SP_LINKS_FILE" > "${SP_LINKS_FILE}.tmp" && mv "${SP_LINKS_FILE}.tmp" "$SP_LINKS_FILE"
+
+    debug "Added QBO ID $QBO_CUSTOMER_ID to $SP_LINKS_FILE (URL: ${FOLDER_URL:-null}, Link ID: ${FOLDER_LINK_ID:-null})"
 fi
 
 # STEP 5: SEND NOTIFICATION EMAIL VIA RESEND API
