@@ -9,6 +9,8 @@ let currentMode = "lead"; // Modes: "lead", "heal", "deactivate", "demographics"
 let demoSortField = "display_name";
 let demoSortDir = "asc";
 let expandedDrawerIds = new Set();
+let demoCurrentPage = 1;
+let demoPageSize = 50; // Numeric page size or "all"
 
 const ENTITY_LABELS = {
     individual: "Individual / Sole Prop",
@@ -316,6 +318,31 @@ function getFilteredDemographics() {
 }
 
 /**
+ * Reset to page 1 when search or filter dropdowns change
+ */
+function onDemographicsFilterChange() {
+    demoCurrentPage = 1;
+    renderDemographicsTable();
+}
+
+/**
+ * Step forward or backward by delta pages
+ */
+function changeDemographicsPage(delta) {
+    demoCurrentPage = Math.max(1, demoCurrentPage + delta);
+    renderDemographicsTable();
+}
+
+/**
+ * Update rows-per-page setting and reset to page 1
+ */
+function changeDemographicsPageSize(sizeVal) {
+    demoPageSize = sizeVal === "all" ? "all" : (parseInt(sizeVal, 10) || 50);
+    demoCurrentPage = 1;
+    renderDemographicsTable();
+}
+
+/**
  * Toggle sort field and direction for Demographics table
  */
 function sortDemographics(field) {
@@ -325,6 +352,7 @@ function sortDemographics(field) {
         demoSortField = field;
         demoSortDir = "asc";
     }
+    demoCurrentPage = 1;
 
     // Update header sort indicators
     document.querySelectorAll("#demographics-table thead th.sortable").forEach(th => {
@@ -347,6 +375,11 @@ function renderDemographicsTable() {
     const tbody = document.getElementById("demographics-tbody");
     const countBadge = document.getElementById("demo-count");
     const exportBtn = document.getElementById("btn-export-csv");
+    const paginationBar = document.getElementById("demo-pagination");
+    const pageInfo = document.getElementById("demo-page-info");
+    const pageIndicator = document.getElementById("demo-page-indicator");
+    const prevBtn = document.getElementById("btn-page-prev");
+    const nextBtn = document.getElementById("btn-page-next");
     if (!tbody) return;
 
     const rows = getFilteredDemographics();
@@ -364,12 +397,38 @@ function renderDemographicsTable() {
 
     if (rows.length === 0) {
         tbody.innerHTML = `<tr><td colspan="7" class="demo-empty-state">No active clients match the current filters.</td></tr>`;
+        if (paginationBar) paginationBar.classList.add("hidden");
         return;
+    }
+
+    if (paginationBar) paginationBar.classList.remove("hidden");
+
+    const isShowAll = (demoPageSize === "all");
+    const totalPages = isShowAll ? 1 : Math.max(1, Math.ceil(rows.length / demoPageSize));
+    if (demoCurrentPage > totalPages) {
+        demoCurrentPage = totalPages;
+    }
+
+    const startIdx = isShowAll ? 0 : (demoCurrentPage - 1) * demoPageSize;
+    const endIdx = isShowAll ? rows.length : Math.min(startIdx + demoPageSize, rows.length);
+    const pageRows = rows.slice(startIdx, endIdx);
+
+    if (pageInfo) {
+        pageInfo.textContent = `Showing ${startIdx + 1}–${endIdx} of ${rows.length}`;
+    }
+    if (pageIndicator) {
+        pageIndicator.textContent = `Page ${demoCurrentPage} of ${totalPages}`;
+    }
+    if (prevBtn) {
+        prevBtn.disabled = isShowAll || demoCurrentPage <= 1;
+    }
+    if (nextBtn) {
+        nextBtn.disabled = isShowAll || demoCurrentPage >= totalPages;
     }
 
     const htmlChunks = [];
 
-    rows.forEach(row => {
+    pageRows.forEach(row => {
         const isExpanded = expandedDrawerIds.has(row.id);
         const entityLabel = ENTITY_LABELS[row.entity_type] || row.entity_type;
         const isPaper = row.delivery_format === "paper";

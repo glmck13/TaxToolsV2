@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Client Intake & Profile Hub</title>
-    <link rel="stylesheet" href="/css/intake.css?v=2.3">
+    <link rel="stylesheet" href="/css/intake.css?v=2.5">
 </head>
 <body>
 
@@ -177,6 +177,25 @@
             <div class="section-title-bar">
                 <span class="section-title">📊 Active Client Demographics</span>
                 <div class="demo-header-controls">
+                    <!-- Inline Pagination Controls -->
+                    <div id="demo-pagination" class="demo-pagination">
+                        <span id="demo-page-info" class="demo-page-info">Showing 0–0 of 0</span>
+                        <label for="demo-page-size" class="demo-page-size-label">Rows:</label>
+                        <select id="demo-page-size" class="demo-page-size-select" onchange="changeDemographicsPageSize(this.value)">
+                            <option value="25">25</option>
+                            <option value="50" selected>50</option>
+                            <option value="100">100</option>
+                            <option value="all">All</option>
+                        </select>
+                        <button type="button" id="btn-page-prev" class="btn-page-nav" onclick="changeDemographicsPage(-1)" disabled>
+                            &lsaquo; Prev
+                        </button>
+                        <span id="demo-page-indicator" class="demo-page-indicator">Page 1 of 1</span>
+                        <button type="button" id="btn-page-next" class="btn-page-nav" onclick="changeDemographicsPage(1)" disabled>
+                            Next &rsaquo;
+                        </button>
+                    </div>
+
                     <span id="demo-count" class="badge-status demographics">0 Clients</span>
                     <button type="button" id="btn-export-csv" class="btn-export-csv" onclick="exportDemographicsCSV()">
                         ⬇️ Export CSV (0)
@@ -191,9 +210,9 @@
                     id="demo-search" 
                     class="demo-search-input" 
                     placeholder="Search client, contact, email, phone, or city..." 
-                    oninput="renderDemographicsTable()"
+                    oninput="onDemographicsFilterChange()"
                 >
-                <select id="demo-filter-entity" class="demo-filter-select" onchange="renderDemographicsTable()">
+                <select id="demo-filter-entity" class="demo-filter-select" onchange="onDemographicsFilterChange()">
                     <option value="">All Account Types</option>
                     <option value="individual">Individual / Sole Prop</option>
                     <option value="sm_llc">Single-Member LLC</option>
@@ -203,7 +222,7 @@
                     <option value="non_profit">Non-Profit</option>
                     <option value="trust">Trust / Estate</option>
                 </select>
-                <select id="demo-filter-format" class="demo-filter-select" onchange="renderDemographicsTable()">
+                <select id="demo-filter-format" class="demo-filter-select" onchange="onDemographicsFilterChange()">
                     <option value="">All Formats</option>
                     <option value="electronic">Electronic</option>
                     <option value="paper">Paper</option>
@@ -275,6 +294,6 @@
     </div>
 </div>
 
-<script src="/js/intake.js?v=2.3"></script>
+<script src="/js/intake.js?v=2.4"></script>
 </body>
 </html>
