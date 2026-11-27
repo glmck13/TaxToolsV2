@@ -10,7 +10,7 @@ let demoSortField = "display_name";
 let demoSortDir = "asc";
 let expandedDrawerIds = new Set();
 let demoCurrentPage = 1;
-let demoPageSize = 50; // Numeric page size or "all"
+let demoPageSize = 25; // Numeric page size or "all"
 
 const ENTITY_LABELS = {
     individual: "Individual / Sole Prop",
@@ -337,7 +337,7 @@ function changeDemographicsPage(delta) {
  * Update rows-per-page setting and reset to page 1
  */
 function changeDemographicsPageSize(sizeVal) {
-    demoPageSize = sizeVal === "all" ? "all" : (parseInt(sizeVal, 10) || 50);
+    demoPageSize = sizeVal === "all" ? "all" : (parseInt(sizeVal, 10) || 25);
     demoCurrentPage = 1;
     renderDemographicsTable();
 }
